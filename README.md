@@ -116,7 +116,7 @@ In the session, ask Claude to `post_message` to a channel. Reply in Slack. The r
 
 ## Using it daily
 
-The long launch invocation gets old. Most folks wrap it in a shell function with their own context baked in. A flavor of Joel's setup:
+The long launch invocation gets old. Most folks wrap it in a shell function around a Claude Code custom agent:
 
 ```bash
 # ~/.zshrc
@@ -124,19 +124,19 @@ standup() {
   cd ~/work/notes
   claude --dangerously-skip-permissions \
     --dangerously-load-development-channels server:slack-bus \
-    --append-system-prompt "$(cat ./standup-context.md)"
+    --agent standup-assistant
 }
 ```
 
-`standup-context.md` is a project-local file telling Claude what to do — pull from Linear, write in your voice, which channel to post in, how to handle replies. The system prompt is doing the heavy lifting; slack-bus is just the Slack-side wiring.
+`standup-assistant` is a named agent definition at `~/.claude/agents/standup-assistant.md` with its own system prompt — telling Claude what to pull from Linear, the channels to post in, your voice and tone, how to handle replies.
 
 The shape of a day:
 
-- **Morning** — "post my standup in #standups: shipping X today, blocked on Y." Claude posts in your voice, auto-subscribes to the thread.
-- **Mid-day** — teammate replies *"wait, what about the migration?"* The reply arrives as a system reminder in your Claude session. You give Claude the status; it responds in-thread.
-- **EOD** — "post EOD: shipped X, picking up Z tomorrow." Same loop.
+- **Morning** — "post my standup in #standups." Claude writes a tight summary in your voice, posts it, auto-subscribes to the thread.
+- **Mid-day** — teammate replies *"wait, what about the migration?"* The reply arrives as a system reminder in the same Claude session where you're actually doing the work — so Claude answers from the real context, not from the compressed Slack post.
+- **EOD** — "post EOD update." Same loop.
 
-You never open Slack. Slack comes to you, in the session where you're already doing the work. The leverage isn't that Claude can post — it's that the conversation lives in Slack where your team is, but you stay in Claude.
+That's the leverage. Slack messages are compressed by nature — short, fragmented, lots of detail dropped. Your Claude session isn't compressed — it's the full source. When the team asks follow-ups via Slack, the answer comes back from the source, not from a re-read of the broadcast.
 
 ## Tool surface
 
