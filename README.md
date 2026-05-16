@@ -8,7 +8,7 @@ Async standups. Ticket shaping. Drive-by team Q&A. The conversation lives in Sla
 
 https://github.com/user-attachments/assets/f8aad3a6-2e5b-4ede-8943-08bee0bd245b
 
-Every team has its team-wide bot. But do *you* have your own personal one — with a smirking face, your voice, and a name like **"<Your Name> (Claude)"**? Personal leverage, on the side of what your team's already running.
+Sure, your team has a bot. But do *you* have one of your own — running on your laptop, posting in your voice, answering to something like **"<Your Name> (Claude)"**? Personal leverage, on the side of whatever the team's already shipped.
 
 > **Status:** experimental. Built over a weekend. Working well enough to dogfood, rough enough that you should expect bumps. Feedback welcome.
 
