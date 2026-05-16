@@ -114,6 +114,30 @@ claude --dangerously-load-development-channels server:slack-bus
 
 In the session, ask Claude to `post_message` to a channel. Reply in Slack. The reply should arrive as a system reminder. That's the whole loop.
 
+## Using it daily
+
+The long launch invocation gets old. Most folks wrap it in a shell function with their own context baked in. A flavor of Joel's setup:
+
+```bash
+# ~/.zshrc
+standup() {
+  cd ~/work/notes
+  claude --dangerously-skip-permissions \
+    --dangerously-load-development-channels server:slack-bus \
+    --append-system-prompt "$(cat ./standup-context.md)"
+}
+```
+
+`standup-context.md` is a project-local file telling Claude what to do — pull from Linear, write in your voice, which channel to post in, how to handle replies. The system prompt is doing the heavy lifting; slack-bus is just the Slack-side wiring.
+
+The shape of a day:
+
+- **Morning** — "post my standup in #standups: shipping X today, blocked on Y." Claude posts in your voice, auto-subscribes to the thread.
+- **Mid-day** — teammate replies *"wait, what about the migration?"* The reply arrives as a system reminder in your Claude session. You give Claude the status; it responds in-thread.
+- **EOD** — "post EOD: shipped X, picking up Z tomorrow." Same loop.
+
+You never open Slack. Slack comes to you, in the session where you're already doing the work. The leverage isn't that Claude can post — it's that the conversation lives in Slack where your team is, but you stay in Claude.
+
 ## Tool surface
 
 **Messaging** — `post_message`, `update_message`, `delete_message`, `add_reaction`
