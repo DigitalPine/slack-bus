@@ -11,3 +11,6 @@ CLAUDE.md
 
 # Local launchd plists (users generate their own from the template)
 LaunchAgents/
+
+# Raw recording sources — keep demo.mp4 in repo, ignore the timestamped originals
+docs/demo-*.mp4
