@@ -6,7 +6,7 @@ Post to Slack from Claude. Your team replies in the thread. Their replies route 
 
 Async standups. Ticket shaping. Drive-by team Q&A. The conversation lives in Slack where your team already is; you live in Claude; slack-bus is the bridge.
 
-<video src="https://github.com/DigitalPine/slack-bus/raw/main/docs/demo.mp4" controls muted playsinline width="100%"></video>
+https://github.com/user-attachments/assets/f8aad3a6-2e5b-4ede-8943-08bee0bd245b
 
 The framing most people land on: make the bot **"<Your Name> (Claude)"**. The bot *is* you, with Claude driving. Your teammates talk to it as if it were you, because for the purposes of that conversation, it is.
 
