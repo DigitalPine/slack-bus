@@ -2,9 +2,9 @@
 
 **Be in Slack while you're in Claude.**
 
-Post to Slack from Claude. Your team replies in the thread. Their replies route back to Claude as system reminders mid-turn — Claude reads them, writes a response, posts it. To your team it looks like a normal Slack conversation with you. You never leave your editor.
+Your Claude session is the source — work-in-progress, thinking, the rich context Slack messages can't fit. slack-bus brings the conversation back: teammates reply in Slack, the reply lands in your session as a system reminder, your agent answers from the source. You stay in flow. You stop being the middleman between your work and your team.
 
-Async standups. Ticket shaping. Drive-by team Q&A. The conversation lives in Slack where your team already is; you live in Claude; slack-bus is the bridge.
+Async standups. Ticket shaping. Drive-by team Q&A. Handled by your agent from inside the work — not by you context-switching between Slack and Claude all day.
 
 https://github.com/user-attachments/assets/f8aad3a6-2e5b-4ede-8943-08bee0bd245b
 
