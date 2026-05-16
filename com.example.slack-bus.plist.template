@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd template for slack-bus. Copy to ~/Library/LaunchAgents/, customize
+  the placeholders below, then:
+
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.<you>.slack-bus.plist
+
+  Replace:
+    com.example.slack-bus                  → reverse-domain label of your choice
+    YOUR_INSTANCE                          → e.g. "default", "personal", "work"
+    42001                                  → any free localhost port
+    /Users/YOU/Code/slack-bus              → wherever you cloned this repo
+    SLACK_BOT_TOKEN / SLACK_APP_TOKEN      → tokens from your Slack app
+
+  Tokens via env: prefer sourcing from ~/.zshrc (as below) over hardcoding here.
+  This file ends up in your home dir; tokens at rest in a plist are easy to
+  accidentally screen-share or back up unencrypted.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.example.slack-bus</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/zsh</string>
+        <string>-c</string>
+        <string>eval "$(grep '^export SLACK_' ~/.zshrc)" &amp;&amp; SLACK_BUS_INSTANCE=YOUR_INSTANCE SLACK_BUS_PORT=42001 exec /Users/YOU/.bun/bin/bun /Users/YOU/Code/slack-bus/bus-mcp.ts</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/YOU/Code/slack-bus</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/slack-bus-YOUR_INSTANCE.stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/tmp/slack-bus-YOUR_INSTANCE.stderr.log</string>
+</dict>
+</plist>

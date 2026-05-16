@@ -1,0 +1,9 @@
+{
+  "_comment": "Add slack-bus to any project's .mcp.json. The URL's port must match a running bus (see ~/Library/LaunchAgents/com.digitalpine.slack-bus-*.plist) — 42001 for digitalpine, 42002 for onlook.",
+  "mcpServers": {
+    "slack-bus": {
+      "type": "http",
+      "url": "http://localhost:42001/mcp"
+    }
+  }
+}

@@ -1,0 +1,65 @@
+# Slack app manifest — your personal "<You> (Claude)" bot.
+#
+# The framing: this bot IS you, with Claude driving. Teammates talk to it
+# like they'd talk to you. Most people name it "<Their Name> (Claude)" so
+# the coupling is explicit.
+#
+# To install:
+#   1. https://api.slack.com/apps?new_app=1 → "From a manifest"
+#   2. Pick the workspace, paste this file
+#   3. Replace the ALL_CAPS placeholders below
+#   4. After creation:
+#      - Basic Information → App-Level Tokens → generate one with
+#        `connections:write` scope. This is SLACK_APP_TOKEN (xapp-...)
+#      - Install App → install to workspace → copy the Bot User OAuth
+#        Token. This is SLACK_BOT_TOKEN (xoxb-...)
+#      - Confirm Socket Mode is enabled
+
+display_information:
+  name: YOUR_NAME (Claude)
+  description: YOUR_NAME, but Claude...
+  background_color: "#041630"
+
+features:
+  bot_user:
+    display_name: YOUR_NAME (Claude)
+    always_online: false
+
+oauth_config:
+  scopes:
+    bot:
+      # Posting / editing / reacting
+      - chat:write
+      - reactions:write
+
+      # Reading channels the bot is in (Socket Mode needs these to deliver
+      # message events; the bus needs them to fetch history + look up names)
+      - channels:read
+      - channels:history
+      - groups:read
+      - groups:history
+      - im:read
+      - im:history
+      - mpim:read
+      - mpim:history
+
+      # User lookups (for resolving names in inbound events)
+      - users:read
+
+      # ─── Optional: uncomment for Phase 2 tools ─────────────────────────
+      # - channels:join       # join_channel tool
+      # - channels:manage     # create_channel, invite_users tools
+      # - pins:write          # pin_message tool
+      # - files:write         # upload_image, upload_snippet tools
+      # - files:read          # get_image_from_slack tool
+
+settings:
+  event_subscriptions:
+    bot_events:
+      - message.channels
+      - message.groups
+      - message.im
+      - message.mpim
+  socket_mode_enabled: true
+  org_deploy_enabled: false
+  token_rotation_enabled: false

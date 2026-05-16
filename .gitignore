@@ -1,0 +1,13 @@
+node_modules
+*.log
+.mcp.json
+.env
+.env.local
+
+# Local Claude/agent state — internal, not for public consumption
+.claude/
+.devlog/
+CLAUDE.md
+
+# Local launchd plists (users generate their own from the template)
+LaunchAgents/
