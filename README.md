@@ -8,7 +8,7 @@ Async standups. Ticket shaping. Drive-by team Q&A. The conversation lives in Sla
 
 https://github.com/user-attachments/assets/f8aad3a6-2e5b-4ede-8943-08bee0bd245b
 
-The framing most people land on: make the bot **"<Your Name> (Claude)"**. The bot *is* you, with Claude driving. Your teammates talk to it as if it were you, because for the purposes of that conversation, it is.
+Every team has its team-wide bot. But do *you* have your own personal one — with a smirking face, your voice, and a name like **"<Your Name> (Claude)"**? Personal leverage, on the side of what your team's already running.
 
 > **Status:** experimental. Built over a weekend. Working well enough to dogfood, rough enough that you should expect bumps. Feedback welcome.
 
