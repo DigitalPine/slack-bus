@@ -48,29 +48,35 @@ You'll need:
 
 Go to https://api.slack.com/apps → **Create New App** → **From a manifest**. Paste `slack-app-manifest.yml` from this repo. Replace the `YOUR_NAME` placeholders (most people use their first name — the convention is "<Your Name> (Claude)" so it's clear the bot is you, with Claude driving).
 
-Then:
-- Under **Basic Information** → **App-Level Tokens** → generate one with `connections:write` scope. This is your `SLACK_APP_TOKEN` (`xapp-...`).
-- Under **Install App** → install to workspace → copy the **Bot User OAuth Token**. This is your `SLACK_BOT_TOKEN` (`xoxb-...`).
-- Under **Socket Mode** → confirm it's enabled.
+You need **two tokens** (not the Client Secret — see below):
 
-### 2. Configure tokens
+- **`SLACK_APP_TOKEN`** (`xapp-...`) — for Socket Mode (inbound events).
+  Under **Basic Information** → scroll to **App-Level Tokens** → **Generate Token and Scopes** → name it `slack-bus` → add the `connections:write` scope → **Generate** → copy.
+- **`SLACK_BOT_TOKEN`** (`xoxb-...`) — for Web API calls (posting, lookups).
+  Under **Install App** → **Install to Workspace** → authorize → copy the **Bot User OAuth Token** from the top of the page.
+- Under **Socket Mode** (left sidebar) → confirm it's enabled.
 
-Export both tokens in your shell (e.g. `~/.zshrc`):
+> **Heads-up on the Client Secret.** "Basic Information" → **App Credentials** prominently shows a **Client ID**, **Client Secret**, **Signing Secret**, and **Verification Token**. You don't need any of those for slack-bus — they're for distributed apps doing OAuth install flows on arbitrary workspaces. slack-bus is a single-workspace bot you install yourself. The only two values that matter are the `xapp-` and `xoxb-` tokens above.
 
-```bash
-export SLACK_BOT_TOKEN="xoxb-..."
-export SLACK_APP_TOKEN="xapp-..."
-```
-
-### 3. Install dependencies
+### 2. Install + configure tokens
 
 ```bash
 git clone https://github.com/DigitalPine/slack-bus.git ~/Code/slack-bus
 cd ~/Code/slack-bus
 bun install
+cp .env.example .env
 ```
 
-### 4. Run the daemon
+Open `.env` and paste your two tokens in:
+
+```bash
+SLACK_BOT_TOKEN=xoxb-...   # the Bot User OAuth Token from "Install App"
+SLACK_APP_TOKEN=xapp-...   # the App-Level Token you generated
+```
+
+Bun auto-loads `.env` when you run the daemon, so that's all the wiring needed for foreground use. (For launchd, put the same values into the plist's `EnvironmentVariables` block instead — see `com.example.slack-bus.plist.template`.)
+
+### 3. Run the daemon
 
 For a quick foreground test:
 
@@ -89,9 +95,9 @@ For background, launchd-managed:
 2. Edit the placeholders (label, instance, port, paths).
 3. `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.<you>.slack-bus.plist`.
 
-### 5. Wire it into Claude Code
+### 4. Wire it into Claude Code
 
-Add to your project's `.mcp.json` (or `~/.mcp.json` global):
+Copy `.mcp.example.json` (in this repo) into your project's `.mcp.json`, or into `~/.mcp.json` for all projects. It looks like:
 
 ```json
 {
