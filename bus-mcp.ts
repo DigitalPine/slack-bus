@@ -25,6 +25,7 @@ import {
 	ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { App } from "@slack/bolt";
+import type { GenericMessageEvent } from "@slack/types";
 import { randomUUID } from "node:crypto";
 import { appendFileSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
@@ -164,7 +165,7 @@ async function getChannelName(channelId: string): Promise<string> {
 	if (cached?.name) return cached.name;
 	try {
 		const info = await slack.conversations.info({ channel: channelId });
-		const ch = info.channel as any;
+		const ch = info.channel;
 		if (ch?.id) channelCache.set(ch.id, ch);
 		return ch?.name ?? channelId;
 	} catch {
@@ -203,18 +204,20 @@ function threadKey(channel: string, ts: string): string {
 // Slack inbound event router. Same logic as the unix-socket bus, but pushes
 // via the per-session MCP transport instead of a socket frame.
 slackApp.message(async ({ message }) => {
-	if ((message as any).subtype) return;
-	if (!("text" in message) || !message.text) return;
-	if (!("user" in message) || !message.user) return;
+	// Bolt's `message` event is a union over many subtypes; we only route
+	// plain user messages. The `subtype === undefined` discriminator narrows
+	// to GenericMessageEvent, which carries channel/user/ts/thread_ts cleanly.
+	if (message.subtype !== undefined) return;
+	const m = message as GenericMessageEvent;
+	if (!m.text || !m.user) return;
 
 	const myId = await getBotUserId();
-	if (message.user === myId) return;
+	if (m.user === myId) return;
 
-	const channelId = (message as any).channel as string;
-	const threadTs =
-		"thread_ts" in message ? ((message as any).thread_ts as string | undefined) : undefined;
+	const channelId = m.channel;
+	const threadTs = m.thread_ts;
 	const isReply = !!threadTs;
-	const tKey = isReply ? threadKey(channelId, threadTs!) : null;
+	const tKey = isReply ? threadKey(channelId, threadTs) : null;
 
 	const matches: Array<{ session: Session; kind: "thread_reply" | "channel_message" }> = [];
 	for (const session of sessions.values()) {
@@ -227,7 +230,7 @@ slackApp.message(async ({ message }) => {
 	if (matches.length === 0) return;
 
 	const [userName, channelName] = await Promise.all([
-		getUserName(message.user),
+		getUserName(m.user),
 		getChannelName(channelId),
 	]);
 
@@ -245,8 +248,8 @@ slackApp.message(async ({ message }) => {
 			kind,
 			channel_id: channelId,
 			channel_name: channelName,
-			ts: (message as any).ts,
-			user_id: message.user,
+			ts: m.ts,
+			user_id: m.user,
 			user_name: userName,
 		};
 		if (threadTs) meta.thread_ts = threadTs;
@@ -255,7 +258,7 @@ slackApp.message(async ({ message }) => {
 			.notification({
 				method: "notifications/claude/channel",
 				params: {
-					content: message.text,
+					content: m.text,
 					meta,
 				},
 			})
@@ -479,7 +482,7 @@ const TOOLS: Tool[] = [
 			required: ["channel", "thread_ts"],
 		},
 		handler: async (_session, args) => {
-			const r = await (slack as any).chat.startStream({
+			const r = await slack.chat.startStream({
 				channel: args.channel,
 				thread_ts: args.thread_ts,
 				markdown_text: args.markdown_text,
@@ -506,7 +509,7 @@ const TOOLS: Tool[] = [
 			required: ["channel", "ts", "markdown_text"],
 		},
 		handler: async (_session, args) => {
-			const r = await (slack as any).chat.appendStream({
+			const r = await slack.chat.appendStream({
 				channel: args.channel,
 				ts: args.ts,
 				markdown_text: args.markdown_text,
@@ -536,7 +539,7 @@ const TOOLS: Tool[] = [
 			required: ["channel", "ts"],
 		},
 		handler: async (_session, args) => {
-			const r = await (slack as any).chat.stopStream({
+			const r = await slack.chat.stopStream({
 				channel: args.channel,
 				ts: args.ts,
 				markdown_text: args.markdown_text,
@@ -570,7 +573,7 @@ const TOOLS: Tool[] = [
 			required: ["channel_id", "thread_ts", "status"],
 		},
 		handler: async (_session, args) => {
-			await (slack as any).assistant.threads.setStatus({
+			await slack.assistant.threads.setStatus({
 				channel_id: args.channel_id,
 				thread_ts: args.thread_ts,
 				status: args.status,
@@ -734,16 +737,20 @@ const TOOLS: Tool[] = [
 			}
 			const fileBuffer = await readFile(args.file_path);
 			const filename = String(args.file_path).split("/").pop() || "image.png";
-			const uploadParams: Record<string, any> = { file: fileBuffer, filename };
-			if (args.title) uploadParams.title = args.title;
-			if (args.alt_text) uploadParams.alt_text = args.alt_text;
-			if (args.channel) uploadParams.channel_id = args.channel;
-			if (args.initial_comment) uploadParams.initial_comment = args.initial_comment;
-			if (args.thread_ts) uploadParams.thread_ts = args.thread_ts;
-
-			const result = await slack.files.uploadV2(uploadParams as any);
-			// SDK wraps response: result.files[0].files[0].id
-			const fileId = (result as any).files?.[0]?.files?.[0]?.id;
+			const result = await slack.files.uploadV2({
+				file: fileBuffer,
+				filename,
+				title: args.title,
+				alt_text: args.alt_text,
+				channel_id: args.channel,
+				initial_comment: args.initial_comment,
+				thread_ts: args.thread_ts,
+			});
+			// The uploadV2 helper wraps the response in an extra layer the
+			// declared WebAPICallResult type doesn't capture: the file ID lives at
+			// result.files[0].files[0].id. Narrow with a local type to avoid `any`.
+			type UploadV2Result = { files?: Array<{ files?: Array<{ id?: string }> }> };
+			const fileId = (result as UploadV2Result).files?.[0]?.files?.[0]?.id;
 			if (!fileId) {
 				throw new Error("Upload succeeded but no file ID returned");
 			}
@@ -829,12 +836,11 @@ const TOOLS: Tool[] = [
 			if (!upload.ok) {
 				throw new Error(`Upload failed: ${upload.statusText}`);
 			}
-			const completeParams: Record<string, any> = {
+			await slack.files.completeUploadExternal({
 				files: [{ id: urlRes.file_id, title: snippetTitle }],
 				channel_id: args.channel,
-			};
-			if (args.thread_ts) completeParams.thread_ts = args.thread_ts;
-			await slack.files.completeUploadExternal(completeParams as any);
+				thread_ts: args.thread_ts,
+			});
 			return `Snippet uploaded: ${args.filename} (${contentLength} bytes)`;
 		},
 	},
@@ -884,7 +890,7 @@ const TOOLS: Tool[] = [
 					ts: args.thread_ts,
 					limit,
 				});
-				msgs = ((r.messages ?? []) as any[]).slice(0, limit);
+				msgs = (r.messages ?? []).slice(0, limit);
 			} else {
 				// Channel mode: recent messages, optionally excluding threaded replies.
 				const fetchLimit = exclude ? limit * 5 : limit;
@@ -892,7 +898,7 @@ const TOOLS: Tool[] = [
 					channel: args.channel,
 					limit: fetchLimit,
 				});
-				let extra = (r.messages ?? []) as any[];
+				let extra = r.messages ?? [];
 				if (exclude) {
 					extra = extra.filter((m) => !m.thread_ts || m.thread_ts === m.ts);
 				}
@@ -976,7 +982,7 @@ const TOOLS: Tool[] = [
 		handler: async (_session, args) => {
 			const types = args.types ?? "public_channel,private_channel";
 			const r = await slack.conversations.list({ types });
-			let channels = (r.channels ?? []) as any[];
+			let channels = r.channels ?? [];
 			if (!args.include_archived) channels = channels.filter((c) => !c.is_archived);
 			for (const c of channels) {
 				if (c.id) channelCache.set(c.id, c);
@@ -998,7 +1004,7 @@ const TOOLS: Tool[] = [
 		},
 		handler: async (_session, args) => {
 			const r = await slack.users.list({});
-			let users = (r.members ?? []) as any[];
+			let users = r.members ?? [];
 			if (!args.include_deleted) users = users.filter((u) => !u.deleted);
 			if (!args.include_bots) users = users.filter((u) => !u.is_bot && u.id !== "USLACKBOT");
 			for (const u of users) {
