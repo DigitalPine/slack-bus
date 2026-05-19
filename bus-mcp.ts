@@ -25,7 +25,11 @@ import {
 	ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { App } from "@slack/bolt";
-import type { GenericMessageEvent } from "@slack/types";
+import type {
+	GenericMessageEvent,
+	ReactionAddedEvent,
+	ReactionRemovedEvent,
+} from "@slack/types";
 import { randomUUID } from "node:crypto";
 import { appendFileSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
@@ -271,6 +275,81 @@ slackApp.message(async ({ message }) => {
 	}
 });
 
+// Reaction routing — auto-delivered to sessions subscribed to the target
+// message's thread (parent ts match) or its channel. Bot's own reactions
+// are filtered to avoid echo loops.
+//
+// Limitation: when the reaction is on a *reply inside* a thread we're
+// subscribed to (not on the parent), routing won't match — we'd need a
+// conversations.replies call per reaction to resolve the parent ts. Acceptable
+// for the v1 use case (reactions on the bot's own posts and on parent messages).
+async function routeReactionEvent(
+	event: ReactionAddedEvent | ReactionRemovedEvent,
+	kind: "reaction" | "reaction_removed",
+): Promise<void> {
+	if (event.item.type !== "message") return;
+	const myId = await getBotUserId();
+	if (event.user === myId) return;
+
+	const channelId = event.item.channel;
+	const itemTs = event.item.ts;
+	const tKey = threadKey(channelId, itemTs);
+
+	const matches: Session[] = [];
+	for (const session of sessions.values()) {
+		if (session.threads.has(tKey) || session.channels.has(channelId)) {
+			matches.push(session);
+		}
+	}
+	if (matches.length === 0) return;
+
+	const [userName, channelName] = await Promise.all([
+		getUserName(event.user),
+		getChannelName(channelId),
+	]);
+
+	log(
+		`${kind} :${event.reaction}: in ${channelName}/${itemTs} by ${userName} → ${matches.length} session(s)`,
+	);
+
+	const verb = kind === "reaction" ? "added" : "removed";
+	for (const session of matches) {
+		session.server
+			.notification({
+				method: "notifications/claude/channel",
+				params: {
+					content: `Reaction :${event.reaction}: ${verb} by ${userName} on message ts=${itemTs} in ${channelName}.`,
+					meta: {
+						source: "slack-bus",
+						kind,
+						channel_id: channelId,
+						channel_name: channelName,
+						reaction: event.reaction,
+						item_ts: itemTs,
+						item_user: event.item_user,
+						ts: event.event_ts,
+						user_id: event.user,
+						user_name: userName,
+					},
+				},
+			})
+			.then(() =>
+				log(`notification → ${session.id} dispatched OK (kind=${kind})`),
+			)
+			.catch((err) =>
+				log(`notification → ${session.id} dispatch FAILED: ${err}`),
+			);
+	}
+}
+
+slackApp.event("reaction_added", async ({ event }) => {
+	await routeReactionEvent(event, "reaction");
+});
+
+slackApp.event("reaction_removed", async ({ event }) => {
+	await routeReactionEvent(event, "reaction_removed");
+});
+
 // ─── Tool surface ─────────────────────────────────────────────────────────────
 // One registry, applied to each per-session Server (handlers close over session).
 
@@ -286,7 +365,7 @@ const TOOLS: Tool[] = [
 	{
 		name: "post_message",
 		description:
-			"Post a message to a Slack channel or thread. Accepts Block Kit blocks for rich content; pass `text` as a notification fallback. When posting top-level (no thread_ts), this session is auto-subscribed to replies in the resulting thread — they'll arrive as `notifications/claude/channel` system reminders.",
+			"Post a message to a Slack channel or thread. Accepts Block Kit blocks for rich content; pass `text` as a notification fallback. When posting top-level (no thread_ts), this session is auto-subscribed to BOTH replies in the resulting thread AND reactions on the posted message — they'll arrive as `notifications/claude/channel` system reminders (kinds `thread_reply`, `reaction`, `reaction_removed`).",
 		inputSchema: {
 			type: "object",
 			properties: {
@@ -1083,8 +1162,8 @@ function buildSessionServer(): {
 				tools: {},
 			},
 			instructions: [
-				`This MCP server is the slack-bus for instance "${INSTANCE}". It exposes Slack actions (post/update/delete/react, lookups) plus session-scoped subscriptions for inbound Slack events.`,
-				"When you post a top-level message, the bus auto-subscribes this session to replies. Replies arrive as `notifications/claude/channel` system reminders with kind=thread_reply.",
+				`This MCP server is the slack-bus for instance "${INSTANCE}". It exposes Slack actions (post/update/delete/react, lookups, file ops, streaming) plus session-scoped subscriptions for inbound Slack events.`,
+				"When you post a top-level message, the bus auto-subscribes this session to replies AND to reactions on that message. Inbound events arrive as `notifications/claude/channel` system reminders. kinds: `thread_reply` (someone replied), `channel_message` (new message in a subscribed channel), `reaction` / `reaction_removed` (someone reacted to a subscribed message or to anything in a subscribed channel).",
 				"For channel-wide subscriptions, call `subscribe_channel`. For specific existing threads you didn't post, `subscribe_thread`.",
 				"Slack mrkdwn syntax: *bold*, _italic_, ~strike~, <url|text>, <@USERID>. No standard markdown.",
 				"For rich layouts, post Block Kit `blocks` and a short `text` fallback.",

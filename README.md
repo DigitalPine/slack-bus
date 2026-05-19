@@ -148,7 +148,7 @@ That's the leverage. Slack messages are compressed by nature — short, fragment
 
 **Messaging** — `post_message`, `update_message`, `delete_message`, `add_reaction`. `post_message` accepts Block Kit `blocks` for rich layouts and `text` as a notification fallback.
 
-**Subscription** — `subscribe_channel` (every new message in a channel), `subscribe_thread` (replies in a specific thread). Top-level `post_message` auto-subscribes you to the resulting thread unless you pass `auto_subscribe: false`.
+**Subscription** — `subscribe_channel` (every new message in a channel), `subscribe_thread` (replies in a specific thread). Top-level `post_message` auto-subscribes you to the resulting thread unless you pass `auto_subscribe: false`. Reactions on subscribed messages (and on any message in a subscribed channel) are auto-routed too, as `kind: "reaction"` and `"reaction_removed"`.
 
 **Streaming** — `start_stream` / `append_stream` / `stop_stream` for typing-animation messages. `stop_stream` accepts final Block Kit blocks that render after the streamed text.
 

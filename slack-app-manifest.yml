@@ -31,6 +31,7 @@ oauth_config:
       # Posting / editing / reacting
       - chat:write
       - reactions:write
+      - reactions:read         # observe inbound reaction_added / reaction_removed events
 
       # Reading channels the bot is in (Socket Mode needs these to deliver
       # message events; the bus needs them to fetch history + look up names)
@@ -46,12 +47,14 @@ oauth_config:
       # User lookups (for resolving names in inbound events)
       - users:read
 
-      # ─── Optional: uncomment for Phase 2 tools ─────────────────────────
+      # File operations (upload_image, upload_snippet, get_image_from_slack)
+      - files:write
+      - files:read
+
+      # ─── Optional: uncomment for the rest of the tool surface ──────────
       # - channels:join       # join_channel tool
       # - channels:manage     # create_channel, invite_users tools
       # - pins:write          # pin_message tool
-      # - files:write         # upload_image, upload_snippet tools
-      # - files:read          # get_image_from_slack tool
 
 settings:
   event_subscriptions:
@@ -60,6 +63,8 @@ settings:
       - message.groups
       - message.im
       - message.mpim
+      - reaction_added
+      - reaction_removed
   socket_mode_enabled: true
   org_deploy_enabled: false
   token_rotation_enabled: false
