@@ -144,22 +144,21 @@ That's the leverage. Slack messages are compressed by nature — short, fragment
 
 ## Tool surface
 
-**Messaging** — `post_message`, `update_message`, `delete_message`, `add_reaction`
+21 tools as of v0.3.0. Defined inline in `bus-mcp.ts` under `const TOOLS` — adding one is appending an entry to that array.
 
-**Subscription** — `subscribe_channel` (every new message in a channel), `subscribe_thread` (replies in a specific thread). Top-level `post_message` auto-subscribes you to the resulting thread.
+**Messaging** — `post_message`, `update_message`, `delete_message`, `add_reaction`. `post_message` accepts Block Kit `blocks` for rich layouts and `text` as a notification fallback.
 
-**Lookups** — `get_channel_context` (recent messages with user names resolved), `get_user_info`, `list_channels`, `list_users`.
+**Subscription** — `subscribe_channel` (every new message in a channel), `subscribe_thread` (replies in a specific thread). Top-level `post_message` auto-subscribes you to the resulting thread unless you pass `auto_subscribe: false`.
 
-Tools defined inline in `bus-mcp.ts` under `const TOOLS`. Adding a tool is appending an entry to that array.
+**Streaming** — `start_stream` / `append_stream` / `stop_stream` for typing-animation messages. `stop_stream` accepts final Block Kit blocks that render after the streamed text.
 
-## What's not here yet
+**Thread status** — `set_thread_status` for rotating loading indicators (`"thinking..."`, `"searching..."`). Auto-clears after two minutes or when a reply is sent.
 
-- Streaming tools (typing-animation messages — `start_stream` / `append_stream` / `stop_stream`)
-- `set_thread_status` (rotating status indicators like "thinking...")
-- File operations (`upload_image`, `upload_snippet`, `get_image_from_slack`)
-- Channel management (`pin_message`, `create_channel`, `invite_users`, `join_channel`)
+**Channel management** — `create_channel`, `join_channel`, `invite_users`, `pin_message`.
 
-These are straightforward to add by following the existing pattern in `bus-mcp.ts`. Open a PR or use them as exercises if you're learning MCP.
+**Files** — `upload_image` (PNG/JPEG/JPG/GIF; with `channel` it posts, without it returns a file ID for Block Kit `image` blocks), `upload_snippet` (text file up to ~1MB), `get_image_from_slack` (download by file ID).
+
+**Lookups** — `get_channel_context` (recent messages with user names resolved; `thread_ts` scopes to a thread's replies), `get_user_info`, `list_channels`, `list_users`. Most lookup tools accept `format: "compact"` (default) to strip Slack API bloat.
 
 ## Known rough edges
 
