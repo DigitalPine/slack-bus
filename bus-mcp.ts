@@ -27,6 +27,7 @@ import {
 import { App } from "@slack/bolt";
 import { randomUUID } from "node:crypto";
 import { appendFileSync } from "node:fs";
+import { readFile, writeFile } from "node:fs/promises";
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
@@ -442,6 +443,396 @@ const TOOLS: Tool[] = [
 		},
 	},
 
+	// ─── Streaming ────────────────────────────────────────────────────────────
+	{
+		name: "start_stream",
+		description:
+			"Start a streaming message in a thread. Returns a ts used by `append_stream` and `stop_stream`. Streaming messages render with a typing animation in Slack.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				channel: { type: "string", description: "Channel ID to stream in." },
+				thread_ts: {
+					type: "string",
+					description: "Thread parent ts. Streaming must be in a thread.",
+				},
+				markdown_text: {
+					type: "string",
+					description: "Initial markdown text (max 12,000 chars).",
+				},
+				recipient_user_id: {
+					type: "string",
+					description:
+						"User ID to receive the stream. Required when streaming in channels, not needed for DMs.",
+				},
+				recipient_team_id: {
+					type: "string",
+					description: "Team ID associated with recipient_user_id. Required with recipient_user_id.",
+				},
+			},
+			required: ["channel", "thread_ts"],
+		},
+		handler: async (_session, args) => {
+			const r = await (slack as any).chat.startStream({
+				channel: args.channel,
+				thread_ts: args.thread_ts,
+				markdown_text: args.markdown_text,
+				recipient_user_id: args.recipient_user_id,
+				recipient_team_id: args.recipient_team_id,
+			});
+			return JSON.stringify({ ok: true, channel: r.channel, ts: r.ts });
+		},
+	},
+	{
+		name: "append_stream",
+		description:
+			"Append text to an active streaming message. Call repeatedly to build the message incrementally. Rate limit: 100+/min.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				channel: { type: "string", description: "Channel ID of the streaming message." },
+				ts: { type: "string", description: "ts returned by `start_stream`." },
+				markdown_text: {
+					type: "string",
+					description: "Markdown text to append (max 12,000 chars).",
+				},
+			},
+			required: ["channel", "ts", "markdown_text"],
+		},
+		handler: async (_session, args) => {
+			const r = await (slack as any).chat.appendStream({
+				channel: args.channel,
+				ts: args.ts,
+				markdown_text: args.markdown_text,
+			});
+			return JSON.stringify({ ok: true, channel: r.channel, ts: r.ts });
+		},
+	},
+	{
+		name: "stop_stream",
+		description:
+			"Finalize a streaming message. Ends the typing animation. Can include final text and Block Kit blocks that render after the streamed content.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				channel: { type: "string", description: "Channel ID of the streaming message." },
+				ts: { type: "string", description: "ts returned by `start_stream`." },
+				markdown_text: {
+					type: "string",
+					description: "Final markdown text to append before stopping (max 12,000 chars).",
+				},
+				blocks: {
+					type: "array",
+					items: { type: "object" },
+					description: "Block Kit blocks to render at the end (max 50).",
+				},
+			},
+			required: ["channel", "ts"],
+		},
+		handler: async (_session, args) => {
+			const r = await (slack as any).chat.stopStream({
+				channel: args.channel,
+				ts: args.ts,
+				markdown_text: args.markdown_text,
+				blocks: args.blocks,
+			});
+			return JSON.stringify({ ok: true, channel: r.channel, ts: r.ts });
+		},
+	},
+
+	// ─── Thread status ────────────────────────────────────────────────────────
+	{
+		name: "set_thread_status",
+		description:
+			'Set a rotating status indicator on a thread (e.g. "thinking...", "searching..."). Displays as "<App Name> <status>". Pass empty string to clear. Auto-clears after 2 minutes or when a reply is sent.',
+		inputSchema: {
+			type: "object",
+			properties: {
+				channel_id: { type: "string", description: "Channel ID containing the thread." },
+				thread_ts: { type: "string", description: "Thread ts to set status on." },
+				status: {
+					type: "string",
+					description: "Status text. Empty string clears.",
+				},
+				loading_messages: {
+					type: "array",
+					items: { type: "string" },
+					description:
+						"Up to 10 messages Slack rotates through as a loading indicator (e.g. ['thinking...', 'searching...']).",
+				},
+			},
+			required: ["channel_id", "thread_ts", "status"],
+		},
+		handler: async (_session, args) => {
+			await (slack as any).assistant.threads.setStatus({
+				channel_id: args.channel_id,
+				thread_ts: args.thread_ts,
+				status: args.status,
+				loading_messages: args.loading_messages,
+			});
+			return args.status
+				? `Status set: "${args.status}"${
+						args.loading_messages
+							? ` (rotating through ${args.loading_messages.length} messages)`
+							: ""
+					}`
+				: "Status cleared";
+		},
+	},
+
+	// ─── Channel management ───────────────────────────────────────────────────
+	{
+		name: "create_channel",
+		description: "Create a new Slack channel. Returns the channel ID and details.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				name: {
+					type: "string",
+					description:
+						"Channel name (lowercase letters, numbers, hyphens, underscores only, max 80 chars).",
+				},
+				is_private: {
+					type: "boolean",
+					description: "Create as private channel (default: false).",
+				},
+			},
+			required: ["name"],
+		},
+		handler: async (_session, args) => {
+			if (!/^[a-z0-9-_]+$/.test(args.name) || args.name.length > 80) {
+				throw new Error("name must be lowercase letters, numbers, hyphens, underscores; max 80 chars");
+			}
+			const r = await slack.conversations.create({
+				name: args.name,
+				is_private: !!args.is_private,
+			});
+			if (!r.ok || !r.channel) {
+				throw new Error(`create_channel failed: ${r.error ?? "unknown"}`);
+			}
+			return JSON.stringify(
+				{
+					success: true,
+					channel: {
+						id: r.channel.id,
+						name: r.channel.name,
+						is_private: r.channel.is_private,
+					},
+				},
+				null,
+				2,
+			);
+		},
+	},
+	{
+		name: "join_channel",
+		description: "Join a Slack channel. Bot must have channels:join scope.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				channel: { type: "string", description: "Channel ID to join." },
+			},
+			required: ["channel"],
+		},
+		handler: async (_session, args) => {
+			const r = await slack.conversations.join({ channel: args.channel });
+			if (!r.ok || !r.channel) {
+				throw new Error(`join_channel failed: ${r.error ?? "unknown"}`);
+			}
+			return JSON.stringify(
+				{ success: true, channel: { id: r.channel.id, name: r.channel.name } },
+				null,
+				2,
+			);
+		},
+	},
+	{
+		name: "invite_users",
+		description: "Invite one or more users to a channel.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				channel: { type: "string", description: "Channel ID to invite users to." },
+				users: {
+					type: "array",
+					items: { type: "string" },
+					description: "User IDs to invite (e.g. ['U123','U456']).",
+				},
+			},
+			required: ["channel", "users"],
+		},
+		handler: async (_session, args) => {
+			const users: string[] = args.users ?? [];
+			if (users.length === 0) throw new Error("at least one user ID is required");
+			const r = await slack.conversations.invite({
+				channel: args.channel,
+				users: users.join(","),
+			});
+			if (!r.ok) throw new Error(`invite_users failed: ${r.error ?? "unknown"}`);
+			return JSON.stringify(
+				{ success: true, channel: r.channel?.id ?? args.channel, invited_users: users },
+				null,
+				2,
+			);
+		},
+	},
+	{
+		name: "pin_message",
+		description: "Pin a message to a channel.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				channel: { type: "string", description: "Channel ID." },
+				timestamp: { type: "string", description: "Message ts to pin." },
+			},
+			required: ["channel", "timestamp"],
+		},
+		handler: async (_session, args) => {
+			await slack.pins.add({ channel: args.channel, timestamp: args.timestamp });
+			return `Pinned ${args.channel} ts=${args.timestamp}.`;
+		},
+	},
+
+	// ─── Files ────────────────────────────────────────────────────────────────
+	{
+		name: "upload_image",
+		description:
+			"Upload an image to Slack. If `channel` is given, posts it; otherwise just uploads and returns a file ID for use in Block Kit image blocks.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				file_path: {
+					type: "string",
+					description: "Absolute path to image file (PNG, JPEG, JPG, GIF).",
+				},
+				channel: {
+					type: "string",
+					description: "Channel ID to post to (optional). Omit to just upload.",
+				},
+				initial_comment: {
+					type: "string",
+					description: "Comment posted with the image.",
+				},
+				thread_ts: {
+					type: "string",
+					description: "Thread ts (requires channel).",
+				},
+				title: { type: "string", description: "Title for the image." },
+				alt_text: { type: "string", description: "Alt text for accessibility." },
+			},
+			required: ["file_path"],
+		},
+		handler: async (_session, args) => {
+			if (args.thread_ts && !args.channel) {
+				throw new Error("thread_ts requires channel to be specified");
+			}
+			const fileBuffer = await readFile(args.file_path);
+			const filename = String(args.file_path).split("/").pop() || "image.png";
+			const uploadParams: Record<string, any> = { file: fileBuffer, filename };
+			if (args.title) uploadParams.title = args.title;
+			if (args.alt_text) uploadParams.alt_text = args.alt_text;
+			if (args.channel) uploadParams.channel_id = args.channel;
+			if (args.initial_comment) uploadParams.initial_comment = args.initial_comment;
+			if (args.thread_ts) uploadParams.thread_ts = args.thread_ts;
+
+			const result = await slack.files.uploadV2(uploadParams as any);
+			// SDK wraps response: result.files[0].files[0].id
+			const fileId = (result as any).files?.[0]?.files?.[0]?.id;
+			if (!fileId) {
+				throw new Error("Upload succeeded but no file ID returned");
+			}
+
+			let response = `Image uploaded. file_id=${fileId} filename=${filename}`;
+			if (args.channel) {
+				response += `\nPosted to ${args.channel}${args.thread_ts ? ` (in thread)` : ""}`;
+			} else {
+				response += `\n\nTo embed in a message, use this image block:\n${JSON.stringify(
+					{
+						type: "image",
+						slack_file: { id: fileId },
+						alt_text: args.alt_text || filename,
+					},
+					null,
+					2,
+				)}`;
+			}
+			return response;
+		},
+	},
+	{
+		name: "get_image_from_slack",
+		description:
+			"Download a Slack-uploaded image by file ID. Returns the local file path under /tmp.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				file_id: { type: "string", description: "Slack file ID (e.g. F09LN15EWCD)." },
+			},
+			required: ["file_id"],
+		},
+		handler: async (_session, args) => {
+			const info = await slack.files.info({ file: args.file_id });
+			const file = info.file;
+			if (!file || !file.url_private) {
+				throw new Error(`File not found: ${args.file_id}`);
+			}
+			const timestamp = Date.now();
+			const ext = file.filetype || "png";
+			const localPath = `/tmp/slack-image-${timestamp}.${ext}`;
+
+			const res = await fetch(file.url_private, {
+				headers: { Authorization: `Bearer ${SLACK_BOT_TOKEN}` },
+			});
+			if (!res.ok) {
+				throw new Error(`Download failed: ${res.statusText}`);
+			}
+			const buffer = Buffer.from(await res.arrayBuffer());
+			await writeFile(localPath, buffer);
+			return `Image downloaded to: ${localPath}\nName: ${file.name}\nType: ${file.mimetype}\nSize: ${file.size} bytes`;
+		},
+	},
+	{
+		name: "upload_snippet",
+		description: "Upload a text snippet/file to Slack (up to ~1MB).",
+		inputSchema: {
+			type: "object",
+			properties: {
+				channel: { type: "string", description: "Channel ID." },
+				content: { type: "string", description: "Text content to upload." },
+				filename: { type: "string", description: "Filename (e.g. 'code.js')." },
+				title: { type: "string", description: "Title (default: filename)." },
+				thread_ts: { type: "string", description: "Thread ts." },
+			},
+			required: ["channel", "content", "filename"],
+		},
+		handler: async (_session, args) => {
+			const snippetTitle = args.title || args.filename;
+			const contentLength = Buffer.byteLength(args.content, "utf-8");
+			const urlRes = await slack.files.getUploadURLExternal({
+				filename: args.filename,
+				length: contentLength,
+			});
+			if (!urlRes.upload_url || !urlRes.file_id) {
+				throw new Error("Failed to get upload URL or file ID");
+			}
+			const upload = await fetch(urlRes.upload_url, {
+				method: "POST",
+				headers: { "Content-Type": "text/plain" },
+				body: args.content,
+			});
+			if (!upload.ok) {
+				throw new Error(`Upload failed: ${upload.statusText}`);
+			}
+			const completeParams: Record<string, any> = {
+				files: [{ id: urlRes.file_id, title: snippetTitle }],
+				channel_id: args.channel,
+			};
+			if (args.thread_ts) completeParams.thread_ts = args.thread_ts;
+			await slack.files.completeUploadExternal(completeParams as any);
+			return `Snippet uploaded: ${args.filename} (${contentLength} bytes)`;
+		},
+	},
+
 	// ─── Context / lookups ────────────────────────────────────────────────────
 	{
 		name: "get_channel_context",
@@ -469,32 +860,26 @@ const TOOLS: Tool[] = [
 			let msgs: any[] = [];
 
 			if (args.thread_ts) {
-				try {
-					const r = await slack.conversations.replies({
-						channel: args.channel,
-						ts: args.thread_ts,
-						limit,
-					});
-					msgs = (r.messages ?? []) as any[];
-				} catch (err) {
-					log(`get_channel_context: thread fetch failed: ${err}`);
-				}
-			}
-
-			if (msgs.length < limit) {
-				const remaining = limit - msgs.length;
-				const fetchLimit = exclude ? remaining * 5 : remaining;
+				// Thread mode: scope strictly to the thread's replies (DIG-197).
+				// Slack returns the parent + replies; we return them as-is, capped by limit.
+				const r = await slack.conversations.replies({
+					channel: args.channel,
+					ts: args.thread_ts,
+					limit,
+				});
+				msgs = ((r.messages ?? []) as any[]).slice(0, limit);
+			} else {
+				// Channel mode: recent messages, optionally excluding threaded replies.
+				const fetchLimit = exclude ? limit * 5 : limit;
 				const r = await slack.conversations.history({
 					channel: args.channel,
 					limit: fetchLimit,
 				});
-				let extra = ((r.messages ?? []) as any[]).filter(
-					(m) => !msgs.some((x) => x.ts === m.ts),
-				);
+				let extra = (r.messages ?? []) as any[];
 				if (exclude) {
 					extra = extra.filter((m) => !m.thread_ts || m.thread_ts === m.ts);
 				}
-				msgs = [...msgs, ...extra.slice(0, remaining)];
+				msgs = extra.slice(0, limit);
 			}
 
 			// Enrich with user names
@@ -642,7 +1027,7 @@ function buildSessionServer(): {
 	});
 
 	const server = new Server(
-		{ name: `slack-bus-${INSTANCE}`, version: "0.2.0" },
+		{ name: `slack-bus-${INSTANCE}`, version: "0.3.0" },
 		{
 			capabilities: {
 				experimental: { "claude/channel": {} },
