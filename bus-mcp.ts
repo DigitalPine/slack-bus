@@ -236,21 +236,27 @@ slackApp.message(async ({ message }) => {
 	);
 
 	for (const { session, kind } of matches) {
+		// thread_ts is only meaningful for actual thread replies. For top-level
+		// channel messages, omit it so Claude doesn't pass the message's own ts
+		// to get_channel_context as a thread parent (which returns just that
+		// single message and looks like an empty thread).
+		const meta: Record<string, unknown> = {
+			source: "slack-bus",
+			kind,
+			channel_id: channelId,
+			channel_name: channelName,
+			ts: (message as any).ts,
+			user_id: message.user,
+			user_name: userName,
+		};
+		if (threadTs) meta.thread_ts = threadTs;
+
 		session.server
 			.notification({
 				method: "notifications/claude/channel",
 				params: {
 					content: message.text,
-					meta: {
-						source: "slack-bus",
-						kind,
-						channel_id: channelId,
-						channel_name: channelName,
-						thread_ts: threadTs ?? (message as any).ts,
-						ts: (message as any).ts,
-						user_id: message.user,
-						user_name: userName,
-					},
+					meta,
 				},
 			})
 			.then(() =>
@@ -837,17 +843,28 @@ const TOOLS: Tool[] = [
 	{
 		name: "get_channel_context",
 		description:
-			"Fetch recent messages from a channel (or a thread if thread_ts is given). Returns compact JSON with user names resolved. Use this when you need conversation history before responding.",
+			"Read Slack conversation history. Two modes:\n\n" +
+				"• **Thread mode** (pass `thread_ts`): returns ONLY that thread's messages — parent + replies. Use this whenever the user references a specific thread or you're responding to a `thread_reply` notification. Look for `meta.thread_ts` in recent `notifications/claude/channel` system reminders, or extract from a Slack thread URL.\n\n" +
+				"• **Channel mode** (omit `thread_ts`): returns recent top-level activity in the channel.\n\n" +
+				"Prefer thread mode any time you have a real `thread_ts` available — channel mode pulls broad noise when you only wanted one conversation. Returns compact JSON with user names resolved.",
 		inputSchema: {
 			type: "object",
 			properties: {
 				channel: { type: "string", description: "Channel ID." },
-				limit: { type: "number", description: "Number of messages (default 10)." },
-				thread_ts: { type: "string", description: "Fetch a thread's replies instead." },
+				thread_ts: {
+					type: "string",
+					description:
+						"Thread parent ts. When set, the tool ignores `exclude_threads` and returns strictly that thread's messages (parent + replies). Source from `meta.thread_ts` on a thread_reply notification, or from a Slack thread permalink. Do NOT pass a non-thread message's ts here — it will return only that single message.",
+				},
+				limit: {
+					type: "number",
+					description:
+						"Max messages to return (default 10). For long threads, raise this — Slack returns the OLDEST N replies first, so a low limit on a deep thread misses the recent context.",
+				},
 				exclude_threads: {
 					type: "boolean",
 					description:
-						"Top-level only (skip threaded replies in channel history). Default false.",
+						"Channel-mode only. When true, drops messages that are replies inside threads, returning just top-level posts. Has no effect in thread mode. Default false.",
 				},
 				format: { type: "string", enum: ["compact", "full"] },
 			},
