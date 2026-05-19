@@ -51,6 +51,8 @@ const SLACK_APP_TOKEN = process.env.SLACK_APP_TOKEN;
 if (!SLACK_BOT_TOKEN) throw new Error("SLACK_BOT_TOKEN is required");
 if (!SLACK_APP_TOKEN) throw new Error("SLACK_APP_TOKEN is required");
 
+const BOOT_TIME_MS = Date.now();
+
 const LOG_FILE = `/tmp/slack-bus-${INSTANCE}.log`;
 
 function log(msg: string) {
@@ -1119,6 +1121,46 @@ const TOOLS: Tool[] = [
 			return JSON.stringify(fmt === "compact" ? users.map(compactUser) : users, null, 2);
 		},
 	},
+
+	// ─── Introspection ────────────────────────────────────────────────────────
+	{
+		name: "bus_status",
+		description:
+			"Inspect the slack-bus daemon's current state: instance, uptime, bot identity, all active sessions and their subscriptions (channels + threads). Use to diagnose 'did my notification arrive?' or to confirm which subscriptions this session currently holds. The caller's session is flagged with `is_self: true`.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				include_other_sessions: {
+					type: "boolean",
+					description:
+						"Include subscriptions from other sessions connected to the bus. Default true. Set false to only return your own session's state.",
+				},
+			},
+		},
+		handler: async (session, args) => {
+			const includeOthers = args.include_other_sessions !== false;
+			const myId = await getBotUserId();
+			const allSessions = Array.from(sessions.values());
+			const visible = includeOthers ? allSessions : allSessions.filter((s) => s.id === session.id);
+
+			const out = {
+				instance: INSTANCE,
+				port: PORT,
+				bot_user_id: myId,
+				uptime_seconds: Math.floor((Date.now() - BOOT_TIME_MS) / 1000),
+				current_session_id: session.id,
+				session_count: allSessions.length,
+				visible_session_count: visible.length,
+				sessions: visible.map((s) => ({
+					id: s.id,
+					is_self: s.id === session.id,
+					channels: Array.from(s.channels),
+					threads: Array.from(s.threads),
+				})),
+			};
+			return JSON.stringify(out, null, 2);
+		},
+	},
 ];
 
 // ─── Per-session MCP server factory ───────────────────────────────────────────
@@ -1155,7 +1197,7 @@ function buildSessionServer(): {
 	});
 
 	const server = new Server(
-		{ name: `slack-bus-${INSTANCE}`, version: "0.3.0" },
+		{ name: `slack-bus-${INSTANCE}`, version: "0.4.0" },
 		{
 			capabilities: {
 				experimental: { "claude/channel": {} },

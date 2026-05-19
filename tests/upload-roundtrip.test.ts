@@ -67,6 +67,7 @@ describe("upload_image ↔ get_image_from_slack", () => {
 			"subscribe_thread",
 			"start_stream",
 			"set_thread_status",
+			"bus_status",
 		];
 		for (const name of expected) {
 			expect(tools).toContain(name);

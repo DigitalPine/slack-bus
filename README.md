@@ -144,7 +144,7 @@ That's the leverage. Slack messages are compressed by nature — short, fragment
 
 ## Tool surface
 
-21 tools as of v0.3.0. Defined inline in `bus-mcp.ts` under `const TOOLS` — adding one is appending an entry to that array.
+22 tools as of v0.4.0. Defined inline in `bus-mcp.ts` under `const TOOLS` — adding one is appending an entry to that array.
 
 **Messaging** — `post_message`, `update_message`, `delete_message`, `add_reaction`. `post_message` accepts Block Kit `blocks` for rich layouts and `text` as a notification fallback.
 
@@ -159,6 +159,8 @@ That's the leverage. Slack messages are compressed by nature — short, fragment
 **Files** — `upload_image` (PNG/JPEG/JPG/GIF; with `channel` it posts, without it returns a file ID for Block Kit `image` blocks), `upload_snippet` (text file up to ~1MB), `get_image_from_slack` (download by file ID).
 
 **Lookups** — `get_channel_context` (recent messages with user names resolved; `thread_ts` scopes to a thread's replies), `get_user_info`, `list_channels`, `list_users`. Most lookup tools accept `format: "compact"` (default) to strip Slack API bloat.
+
+**Introspection** — `bus_status` returns the daemon's current state: uptime, bot identity, every active session and its subscriptions. Useful for debugging "did my notification arrive?" or confirming what this session is currently watching.
 
 ## Known rough edges
 
