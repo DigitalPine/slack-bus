@@ -793,13 +793,39 @@ const TOOLS: Tool[] = [
 			const ext = file.filetype || "png";
 			const localPath = `/tmp/slack-image-${timestamp}.${ext}`;
 
-			const res = await fetch(file.url_private, {
-				headers: { Authorization: `Bearer ${SLACK_BOT_TOKEN}` },
-			});
-			if (!res.ok) {
-				throw new Error(`Download failed: ${res.statusText}`);
+			// Race: freshly-uploaded files sometimes 302 to a login interstitial
+			// for a brief window after upload completes. Slack returns HTML
+			// instead of the file bytes. Retry with backoff and validate the
+			// content-type before writing.
+			const backoffsMs = [0, 250, 750, 1500];
+			let buffer: Buffer | null = null;
+			let lastIssue = "";
+			for (const wait of backoffsMs) {
+				if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+				const res = await fetch(file.url_private, {
+					headers: { Authorization: `Bearer ${SLACK_BOT_TOKEN}` },
+				});
+				if (!res.ok) {
+					lastIssue = `HTTP ${res.status} ${res.statusText}`;
+					continue;
+				}
+				const ct = res.headers.get("content-type") ?? "";
+				if (ct.startsWith("text/html")) {
+					lastIssue = `Slack returned HTML (likely auth interstitial — file not yet ready)`;
+					continue;
+				}
+				buffer = Buffer.from(await res.arrayBuffer());
+				if (typeof file.size === "number" && buffer.length !== file.size) {
+					lastIssue = `Size mismatch — expected ${file.size}, got ${buffer.length}`;
+					buffer = null;
+					continue;
+				}
+				break;
 			}
-			const buffer = Buffer.from(await res.arrayBuffer());
+			if (!buffer) {
+				throw new Error(`Download failed after ${backoffsMs.length} attempts: ${lastIssue}`);
+			}
+
 			await writeFile(localPath, buffer);
 			return `Image downloaded to: ${localPath}\nName: ${file.name}\nType: ${file.mimetype}\nSize: ${file.size} bytes`;
 		},
