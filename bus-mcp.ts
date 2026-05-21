@@ -25,6 +25,11 @@ import {
 	ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { App } from "@slack/bolt";
+import type {
+	GenericMessageEvent,
+	ReactionAddedEvent,
+	ReactionRemovedEvent,
+} from "@slack/types";
 import { randomUUID } from "node:crypto";
 import { appendFileSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
@@ -45,6 +50,8 @@ const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN;
 const SLACK_APP_TOKEN = process.env.SLACK_APP_TOKEN;
 if (!SLACK_BOT_TOKEN) throw new Error("SLACK_BOT_TOKEN is required");
 if (!SLACK_APP_TOKEN) throw new Error("SLACK_APP_TOKEN is required");
+
+const BOOT_TIME_MS = Date.now();
 
 const LOG_FILE = `/tmp/slack-bus-${INSTANCE}.log`;
 
@@ -164,7 +171,7 @@ async function getChannelName(channelId: string): Promise<string> {
 	if (cached?.name) return cached.name;
 	try {
 		const info = await slack.conversations.info({ channel: channelId });
-		const ch = info.channel as any;
+		const ch = info.channel;
 		if (ch?.id) channelCache.set(ch.id, ch);
 		return ch?.name ?? channelId;
 	} catch {
@@ -203,18 +210,20 @@ function threadKey(channel: string, ts: string): string {
 // Slack inbound event router. Same logic as the unix-socket bus, but pushes
 // via the per-session MCP transport instead of a socket frame.
 slackApp.message(async ({ message }) => {
-	if ((message as any).subtype) return;
-	if (!("text" in message) || !message.text) return;
-	if (!("user" in message) || !message.user) return;
+	// Bolt's `message` event is a union over many subtypes; we only route
+	// plain user messages. The `subtype === undefined` discriminator narrows
+	// to GenericMessageEvent, which carries channel/user/ts/thread_ts cleanly.
+	if (message.subtype !== undefined) return;
+	const m = message as GenericMessageEvent;
+	if (!m.text || !m.user) return;
 
 	const myId = await getBotUserId();
-	if (message.user === myId) return;
+	if (m.user === myId) return;
 
-	const channelId = (message as any).channel as string;
-	const threadTs =
-		"thread_ts" in message ? ((message as any).thread_ts as string | undefined) : undefined;
+	const channelId = m.channel;
+	const threadTs = m.thread_ts;
 	const isReply = !!threadTs;
-	const tKey = isReply ? threadKey(channelId, threadTs!) : null;
+	const tKey = isReply ? threadKey(channelId, threadTs) : null;
 
 	const matches: Array<{ session: Session; kind: "thread_reply" | "channel_message" }> = [];
 	for (const session of sessions.values()) {
@@ -227,7 +236,7 @@ slackApp.message(async ({ message }) => {
 	if (matches.length === 0) return;
 
 	const [userName, channelName] = await Promise.all([
-		getUserName(message.user),
+		getUserName(m.user),
 		getChannelName(channelId),
 	]);
 
@@ -236,19 +245,92 @@ slackApp.message(async ({ message }) => {
 	);
 
 	for (const { session, kind } of matches) {
+		// thread_ts is only meaningful for actual thread replies. For top-level
+		// channel messages, omit it so Claude doesn't pass the message's own ts
+		// to get_channel_context as a thread parent (which returns just that
+		// single message and looks like an empty thread).
+		const meta: Record<string, unknown> = {
+			source: "slack-bus",
+			kind,
+			channel_id: channelId,
+			channel_name: channelName,
+			ts: m.ts,
+			user_id: m.user,
+			user_name: userName,
+		};
+		if (threadTs) meta.thread_ts = threadTs;
+
 		session.server
 			.notification({
 				method: "notifications/claude/channel",
 				params: {
-					content: message.text,
+					content: m.text,
+					meta,
+				},
+			})
+			.then(() =>
+				log(`notification → ${session.id} dispatched OK (kind=${kind})`),
+			)
+			.catch((err) =>
+				log(`notification → ${session.id} dispatch FAILED: ${err}`),
+			);
+	}
+});
+
+// Reaction routing — auto-delivered to sessions subscribed to the target
+// message's thread (parent ts match) or its channel. Bot's own reactions
+// are filtered to avoid echo loops.
+//
+// Limitation: when the reaction is on a *reply inside* a thread we're
+// subscribed to (not on the parent), routing won't match — we'd need a
+// conversations.replies call per reaction to resolve the parent ts. Acceptable
+// for the v1 use case (reactions on the bot's own posts and on parent messages).
+async function routeReactionEvent(
+	event: ReactionAddedEvent | ReactionRemovedEvent,
+	kind: "reaction" | "reaction_removed",
+): Promise<void> {
+	if (event.item.type !== "message") return;
+	const myId = await getBotUserId();
+	if (event.user === myId) return;
+
+	const channelId = event.item.channel;
+	const itemTs = event.item.ts;
+	const tKey = threadKey(channelId, itemTs);
+
+	const matches: Session[] = [];
+	for (const session of sessions.values()) {
+		if (session.threads.has(tKey) || session.channels.has(channelId)) {
+			matches.push(session);
+		}
+	}
+	if (matches.length === 0) return;
+
+	const [userName, channelName] = await Promise.all([
+		getUserName(event.user),
+		getChannelName(channelId),
+	]);
+
+	log(
+		`${kind} :${event.reaction}: in ${channelName}/${itemTs} by ${userName} → ${matches.length} session(s)`,
+	);
+
+	const verb = kind === "reaction" ? "added" : "removed";
+	for (const session of matches) {
+		session.server
+			.notification({
+				method: "notifications/claude/channel",
+				params: {
+					content: `Reaction :${event.reaction}: ${verb} by ${userName} on message ts=${itemTs} in ${channelName}.`,
 					meta: {
 						source: "slack-bus",
 						kind,
 						channel_id: channelId,
 						channel_name: channelName,
-						thread_ts: threadTs ?? (message as any).ts,
-						ts: (message as any).ts,
-						user_id: message.user,
+						reaction: event.reaction,
+						item_ts: itemTs,
+						item_user: event.item_user,
+						ts: event.event_ts,
+						user_id: event.user,
 						user_name: userName,
 					},
 				},
@@ -260,6 +342,14 @@ slackApp.message(async ({ message }) => {
 				log(`notification → ${session.id} dispatch FAILED: ${err}`),
 			);
 	}
+}
+
+slackApp.event("reaction_added", async ({ event }) => {
+	await routeReactionEvent(event, "reaction");
+});
+
+slackApp.event("reaction_removed", async ({ event }) => {
+	await routeReactionEvent(event, "reaction_removed");
 });
 
 // ─── Tool surface ─────────────────────────────────────────────────────────────
@@ -277,7 +367,7 @@ const TOOLS: Tool[] = [
 	{
 		name: "post_message",
 		description:
-			"Post a message to a Slack channel or thread. Accepts Block Kit blocks for rich content; pass `text` as a notification fallback. When posting top-level (no thread_ts), this session is auto-subscribed to replies in the resulting thread — they'll arrive as `notifications/claude/channel` system reminders.",
+			"Post a message to a Slack channel or thread. Accepts Block Kit blocks for rich content; pass `text` as a notification fallback. When posting top-level (no thread_ts), this session is auto-subscribed to BOTH replies in the resulting thread AND reactions on the posted message — they'll arrive as `notifications/claude/channel` system reminders (kinds `thread_reply`, `reaction`, `reaction_removed`).",
 		inputSchema: {
 			type: "object",
 			properties: {
@@ -473,7 +563,7 @@ const TOOLS: Tool[] = [
 			required: ["channel", "thread_ts"],
 		},
 		handler: async (_session, args) => {
-			const r = await (slack as any).chat.startStream({
+			const r = await slack.chat.startStream({
 				channel: args.channel,
 				thread_ts: args.thread_ts,
 				markdown_text: args.markdown_text,
@@ -500,7 +590,7 @@ const TOOLS: Tool[] = [
 			required: ["channel", "ts", "markdown_text"],
 		},
 		handler: async (_session, args) => {
-			const r = await (slack as any).chat.appendStream({
+			const r = await slack.chat.appendStream({
 				channel: args.channel,
 				ts: args.ts,
 				markdown_text: args.markdown_text,
@@ -530,7 +620,7 @@ const TOOLS: Tool[] = [
 			required: ["channel", "ts"],
 		},
 		handler: async (_session, args) => {
-			const r = await (slack as any).chat.stopStream({
+			const r = await slack.chat.stopStream({
 				channel: args.channel,
 				ts: args.ts,
 				markdown_text: args.markdown_text,
@@ -564,7 +654,7 @@ const TOOLS: Tool[] = [
 			required: ["channel_id", "thread_ts", "status"],
 		},
 		handler: async (_session, args) => {
-			await (slack as any).assistant.threads.setStatus({
+			await slack.assistant.threads.setStatus({
 				channel_id: args.channel_id,
 				thread_ts: args.thread_ts,
 				status: args.status,
@@ -728,16 +818,20 @@ const TOOLS: Tool[] = [
 			}
 			const fileBuffer = await readFile(args.file_path);
 			const filename = String(args.file_path).split("/").pop() || "image.png";
-			const uploadParams: Record<string, any> = { file: fileBuffer, filename };
-			if (args.title) uploadParams.title = args.title;
-			if (args.alt_text) uploadParams.alt_text = args.alt_text;
-			if (args.channel) uploadParams.channel_id = args.channel;
-			if (args.initial_comment) uploadParams.initial_comment = args.initial_comment;
-			if (args.thread_ts) uploadParams.thread_ts = args.thread_ts;
-
-			const result = await slack.files.uploadV2(uploadParams as any);
-			// SDK wraps response: result.files[0].files[0].id
-			const fileId = (result as any).files?.[0]?.files?.[0]?.id;
+			const result = await slack.files.uploadV2({
+				file: fileBuffer,
+				filename,
+				title: args.title,
+				alt_text: args.alt_text,
+				channel_id: args.channel,
+				initial_comment: args.initial_comment,
+				thread_ts: args.thread_ts,
+			});
+			// The uploadV2 helper wraps the response in an extra layer the
+			// declared WebAPICallResult type doesn't capture: the file ID lives at
+			// result.files[0].files[0].id. Narrow with a local type to avoid `any`.
+			type UploadV2Result = { files?: Array<{ files?: Array<{ id?: string }> }> };
+			const fileId = (result as UploadV2Result).files?.[0]?.files?.[0]?.id;
 			if (!fileId) {
 				throw new Error("Upload succeeded but no file ID returned");
 			}
@@ -780,13 +874,39 @@ const TOOLS: Tool[] = [
 			const ext = file.filetype || "png";
 			const localPath = `/tmp/slack-image-${timestamp}.${ext}`;
 
-			const res = await fetch(file.url_private, {
-				headers: { Authorization: `Bearer ${SLACK_BOT_TOKEN}` },
-			});
-			if (!res.ok) {
-				throw new Error(`Download failed: ${res.statusText}`);
+			// Race: freshly-uploaded files sometimes 302 to a login interstitial
+			// for a brief window after upload completes. Slack returns HTML
+			// instead of the file bytes. Retry with backoff and validate the
+			// content-type before writing.
+			const backoffsMs = [0, 250, 750, 1500];
+			let buffer: Buffer | null = null;
+			let lastIssue = "";
+			for (const wait of backoffsMs) {
+				if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+				const res = await fetch(file.url_private, {
+					headers: { Authorization: `Bearer ${SLACK_BOT_TOKEN}` },
+				});
+				if (!res.ok) {
+					lastIssue = `HTTP ${res.status} ${res.statusText}`;
+					continue;
+				}
+				const ct = res.headers.get("content-type") ?? "";
+				if (ct.startsWith("text/html")) {
+					lastIssue = `Slack returned HTML (likely auth interstitial — file not yet ready)`;
+					continue;
+				}
+				buffer = Buffer.from(await res.arrayBuffer());
+				if (typeof file.size === "number" && buffer.length !== file.size) {
+					lastIssue = `Size mismatch — expected ${file.size}, got ${buffer.length}`;
+					buffer = null;
+					continue;
+				}
+				break;
 			}
-			const buffer = Buffer.from(await res.arrayBuffer());
+			if (!buffer) {
+				throw new Error(`Download failed after ${backoffsMs.length} attempts: ${lastIssue}`);
+			}
+
 			await writeFile(localPath, buffer);
 			return `Image downloaded to: ${localPath}\nName: ${file.name}\nType: ${file.mimetype}\nSize: ${file.size} bytes`;
 		},
@@ -823,12 +943,11 @@ const TOOLS: Tool[] = [
 			if (!upload.ok) {
 				throw new Error(`Upload failed: ${upload.statusText}`);
 			}
-			const completeParams: Record<string, any> = {
+			await slack.files.completeUploadExternal({
 				files: [{ id: urlRes.file_id, title: snippetTitle }],
 				channel_id: args.channel,
-			};
-			if (args.thread_ts) completeParams.thread_ts = args.thread_ts;
-			await slack.files.completeUploadExternal(completeParams as any);
+				thread_ts: args.thread_ts,
+			});
 			return `Snippet uploaded: ${args.filename} (${contentLength} bytes)`;
 		},
 	},
@@ -837,17 +956,28 @@ const TOOLS: Tool[] = [
 	{
 		name: "get_channel_context",
 		description:
-			"Fetch recent messages from a channel (or a thread if thread_ts is given). Returns compact JSON with user names resolved. Use this when you need conversation history before responding.",
+			"Read Slack conversation history. Two modes:\n\n" +
+				"• **Thread mode** (pass `thread_ts`): returns ONLY that thread's messages — parent + replies. Use this whenever the user references a specific thread or you're responding to a `thread_reply` notification. Look for `meta.thread_ts` in recent `notifications/claude/channel` system reminders, or extract from a Slack thread URL.\n\n" +
+				"• **Channel mode** (omit `thread_ts`): returns recent top-level activity in the channel.\n\n" +
+				"Prefer thread mode any time you have a real `thread_ts` available — channel mode pulls broad noise when you only wanted one conversation. Returns compact JSON with user names resolved.",
 		inputSchema: {
 			type: "object",
 			properties: {
 				channel: { type: "string", description: "Channel ID." },
-				limit: { type: "number", description: "Number of messages (default 10)." },
-				thread_ts: { type: "string", description: "Fetch a thread's replies instead." },
+				thread_ts: {
+					type: "string",
+					description:
+						"Thread parent ts. When set, the tool ignores `exclude_threads` and returns strictly that thread's messages (parent + replies). Source from `meta.thread_ts` on a thread_reply notification, or from a Slack thread permalink. Do NOT pass a non-thread message's ts here — it will return only that single message.",
+				},
+				limit: {
+					type: "number",
+					description:
+						"Max messages to return (default 10). For long threads, raise this — Slack returns the OLDEST N replies first, so a low limit on a deep thread misses the recent context.",
+				},
 				exclude_threads: {
 					type: "boolean",
 					description:
-						"Top-level only (skip threaded replies in channel history). Default false.",
+						"Channel-mode only. When true, drops messages that are replies inside threads, returning just top-level posts. Has no effect in thread mode. Default false.",
 				},
 				format: { type: "string", enum: ["compact", "full"] },
 			},
@@ -867,7 +997,7 @@ const TOOLS: Tool[] = [
 					ts: args.thread_ts,
 					limit,
 				});
-				msgs = ((r.messages ?? []) as any[]).slice(0, limit);
+				msgs = (r.messages ?? []).slice(0, limit);
 			} else {
 				// Channel mode: recent messages, optionally excluding threaded replies.
 				const fetchLimit = exclude ? limit * 5 : limit;
@@ -875,7 +1005,7 @@ const TOOLS: Tool[] = [
 					channel: args.channel,
 					limit: fetchLimit,
 				});
-				let extra = (r.messages ?? []) as any[];
+				let extra = r.messages ?? [];
 				if (exclude) {
 					extra = extra.filter((m) => !m.thread_ts || m.thread_ts === m.ts);
 				}
@@ -959,7 +1089,7 @@ const TOOLS: Tool[] = [
 		handler: async (_session, args) => {
 			const types = args.types ?? "public_channel,private_channel";
 			const r = await slack.conversations.list({ types });
-			let channels = (r.channels ?? []) as any[];
+			let channels = r.channels ?? [];
 			if (!args.include_archived) channels = channels.filter((c) => !c.is_archived);
 			for (const c of channels) {
 				if (c.id) channelCache.set(c.id, c);
@@ -981,7 +1111,7 @@ const TOOLS: Tool[] = [
 		},
 		handler: async (_session, args) => {
 			const r = await slack.users.list({});
-			let users = (r.members ?? []) as any[];
+			let users = r.members ?? [];
 			if (!args.include_deleted) users = users.filter((u) => !u.deleted);
 			if (!args.include_bots) users = users.filter((u) => !u.is_bot && u.id !== "USLACKBOT");
 			for (const u of users) {
@@ -989,6 +1119,46 @@ const TOOLS: Tool[] = [
 			}
 			const fmt = args.format ?? "compact";
 			return JSON.stringify(fmt === "compact" ? users.map(compactUser) : users, null, 2);
+		},
+	},
+
+	// ─── Introspection ────────────────────────────────────────────────────────
+	{
+		name: "bus_status",
+		description:
+			"Inspect the slack-bus daemon's current state: instance, uptime, bot identity, all active sessions and their subscriptions (channels + threads). Use to diagnose 'did my notification arrive?' or to confirm which subscriptions this session currently holds. The caller's session is flagged with `is_self: true`.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				include_other_sessions: {
+					type: "boolean",
+					description:
+						"Include subscriptions from other sessions connected to the bus. Default true. Set false to only return your own session's state.",
+				},
+			},
+		},
+		handler: async (session, args) => {
+			const includeOthers = args.include_other_sessions !== false;
+			const myId = await getBotUserId();
+			const allSessions = Array.from(sessions.values());
+			const visible = includeOthers ? allSessions : allSessions.filter((s) => s.id === session.id);
+
+			const out = {
+				instance: INSTANCE,
+				port: PORT,
+				bot_user_id: myId,
+				uptime_seconds: Math.floor((Date.now() - BOOT_TIME_MS) / 1000),
+				current_session_id: session.id,
+				session_count: allSessions.length,
+				visible_session_count: visible.length,
+				sessions: visible.map((s) => ({
+					id: s.id,
+					is_self: s.id === session.id,
+					channels: Array.from(s.channels),
+					threads: Array.from(s.threads),
+				})),
+			};
+			return JSON.stringify(out, null, 2);
 		},
 	},
 ];
@@ -1027,15 +1197,15 @@ function buildSessionServer(): {
 	});
 
 	const server = new Server(
-		{ name: `slack-bus-${INSTANCE}`, version: "0.3.0" },
+		{ name: `slack-bus-${INSTANCE}`, version: "0.4.0" },
 		{
 			capabilities: {
 				experimental: { "claude/channel": {} },
 				tools: {},
 			},
 			instructions: [
-				`This MCP server is the slack-bus for instance "${INSTANCE}". It exposes Slack actions (post/update/delete/react, lookups) plus session-scoped subscriptions for inbound Slack events.`,
-				"When you post a top-level message, the bus auto-subscribes this session to replies. Replies arrive as `notifications/claude/channel` system reminders with kind=thread_reply.",
+				`This MCP server is the slack-bus for instance "${INSTANCE}". It exposes Slack actions (post/update/delete/react, lookups, file ops, streaming) plus session-scoped subscriptions for inbound Slack events.`,
+				"When you post a top-level message, the bus auto-subscribes this session to replies AND to reactions on that message. Inbound events arrive as `notifications/claude/channel` system reminders. kinds: `thread_reply` (someone replied), `channel_message` (new message in a subscribed channel), `reaction` / `reaction_removed` (someone reacted to a subscribed message or to anything in a subscribed channel).",
 				"For channel-wide subscriptions, call `subscribe_channel`. For specific existing threads you didn't post, `subscribe_thread`.",
 				"Slack mrkdwn syntax: *bold*, _italic_, ~strike~, <url|text>, <@USERID>. No standard markdown.",
 				"For rich layouts, post Block Kit `blocks` and a short `text` fallback.",

@@ -144,11 +144,11 @@ That's the leverage. Slack messages are compressed by nature — short, fragment
 
 ## Tool surface
 
-21 tools as of v0.3.0. Defined inline in `bus-mcp.ts` under `const TOOLS` — adding one is appending an entry to that array.
+22 tools as of v0.4.0. Defined inline in `bus-mcp.ts` under `const TOOLS` — adding one is appending an entry to that array.
 
 **Messaging** — `post_message`, `update_message`, `delete_message`, `add_reaction`. `post_message` accepts Block Kit `blocks` for rich layouts and `text` as a notification fallback.
 
-**Subscription** — `subscribe_channel` (every new message in a channel), `subscribe_thread` (replies in a specific thread). Top-level `post_message` auto-subscribes you to the resulting thread unless you pass `auto_subscribe: false`.
+**Subscription** — `subscribe_channel` (every new message in a channel), `subscribe_thread` (replies in a specific thread). Top-level `post_message` auto-subscribes you to the resulting thread unless you pass `auto_subscribe: false`. Reactions on subscribed messages (and on any message in a subscribed channel) are auto-routed too, as `kind: "reaction"` and `"reaction_removed"`.
 
 **Streaming** — `start_stream` / `append_stream` / `stop_stream` for typing-animation messages. `stop_stream` accepts final Block Kit blocks that render after the streamed text.
 
@@ -159,6 +159,8 @@ That's the leverage. Slack messages are compressed by nature — short, fragment
 **Files** — `upload_image` (PNG/JPEG/JPG/GIF; with `channel` it posts, without it returns a file ID for Block Kit `image` blocks), `upload_snippet` (text file up to ~1MB), `get_image_from_slack` (download by file ID).
 
 **Lookups** — `get_channel_context` (recent messages with user names resolved; `thread_ts` scopes to a thread's replies), `get_user_info`, `list_channels`, `list_users`. Most lookup tools accept `format: "compact"` (default) to strip Slack API bloat.
+
+**Introspection** — `bus_status` returns the daemon's current state: uptime, bot identity, every active session and its subscriptions. Useful for debugging "did my notification arrive?" or confirming what this session is currently watching.
 
 ## Known rough edges
 
