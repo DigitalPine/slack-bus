@@ -785,15 +785,15 @@ const TOOLS: Tool[] = [
 
 	// ─── Files ────────────────────────────────────────────────────────────────
 	{
-		name: "upload_image",
+		name: "upload_file",
 		description:
-			"Upload an image to Slack. If `channel` is given, posts it; otherwise just uploads and returns a file ID for use in Block Kit image blocks.",
+			"Upload a file from disk to Slack. Any file type Slack accepts — images (PNG, JPEG, GIF), video (MP4, MOV), audio, PDF, archives, etc. With `channel`, posts it (Slack renders most types inline — videos play, images preview, PDFs get a viewer). Without `channel`, just uploads and returns the file ID. For images specifically, the file ID can be embedded via a Block Kit `image` block (returned in the response).",
 		inputSchema: {
 			type: "object",
 			properties: {
 				file_path: {
 					type: "string",
-					description: "Absolute path to image file (PNG, JPEG, JPG, GIF).",
+					description: "Absolute path to the file.",
 				},
 				channel: {
 					type: "string",
@@ -801,14 +801,17 @@ const TOOLS: Tool[] = [
 				},
 				initial_comment: {
 					type: "string",
-					description: "Comment posted with the image.",
+					description: "Comment posted alongside the file.",
 				},
 				thread_ts: {
 					type: "string",
 					description: "Thread ts (requires channel).",
 				},
-				title: { type: "string", description: "Title for the image." },
-				alt_text: { type: "string", description: "Alt text for accessibility." },
+				title: { type: "string", description: "Title shown on the file in Slack." },
+				alt_text: {
+					type: "string",
+					description: "Alt text for accessibility. Mainly meaningful for images.",
+				},
 			},
 			required: ["file_path"],
 		},
@@ -817,7 +820,7 @@ const TOOLS: Tool[] = [
 				throw new Error("thread_ts requires channel to be specified");
 			}
 			const fileBuffer = await readFile(args.file_path);
-			const filename = String(args.file_path).split("/").pop() || "image.png";
+			const filename = String(args.file_path).split("/").pop() || "file";
 			const result = await slack.files.uploadV2({
 				file: fileBuffer,
 				filename,
@@ -836,10 +839,15 @@ const TOOLS: Tool[] = [
 				throw new Error("Upload succeeded but no file ID returned");
 			}
 
-			let response = `Image uploaded. file_id=${fileId} filename=${filename}`;
+			// Only emit the Block Kit image-block hint for image files —
+			// Slack auto-renders video/audio/pdf inline without any block.
+			const ext = filename.split(".").pop()?.toLowerCase() ?? "";
+			const isImage = ["png", "jpg", "jpeg", "gif", "webp"].includes(ext);
+
+			let response = `File uploaded. file_id=${fileId} filename=${filename}`;
 			if (args.channel) {
-				response += `\nPosted to ${args.channel}${args.thread_ts ? ` (in thread)` : ""}`;
-			} else {
+				response += `\nPosted to ${args.channel}${args.thread_ts ? ` (in thread)` : ""}. Slack will render it inline.`;
+			} else if (isImage) {
 				response += `\n\nTo embed in a message, use this image block:\n${JSON.stringify(
 					{
 						type: "image",
@@ -849,14 +857,16 @@ const TOOLS: Tool[] = [
 					null,
 					2,
 				)}`;
+			} else {
+				response += `\n\nTo share the file in a channel, call post_message with the file_id referenced in your text, or re-call upload_file with a channel argument.`;
 			}
 			return response;
 		},
 	},
 	{
-		name: "get_image_from_slack",
+		name: "get_file_from_slack",
 		description:
-			"Download a Slack-uploaded image by file ID. Returns the local file path under /tmp.",
+			"Download any Slack-uploaded file by file ID — image, video, audio, PDF, snippet, etc. Returns the local file path under /tmp. The extension matches the original file's type.",
 		inputSchema: {
 			type: "object",
 			properties: {
@@ -871,8 +881,12 @@ const TOOLS: Tool[] = [
 				throw new Error(`File not found: ${args.file_id}`);
 			}
 			const timestamp = Date.now();
-			const ext = file.filetype || "png";
-			const localPath = `/tmp/slack-image-${timestamp}.${ext}`;
+			// Prefer file.filetype, then derive from file.name's extension
+			// (Slack sometimes returns empty filetype/mimetype for very recent
+			// uploads even when file.name is set), final fallback "bin".
+			const ext =
+				file.filetype || file.name?.split(".").pop()?.toLowerCase() || "bin";
+			const localPath = `/tmp/slack-file-${timestamp}.${ext}`;
 
 			// Race: freshly-uploaded files sometimes 302 to a login interstitial
 			// for a brief window after upload completes. Slack returns HTML
@@ -908,25 +922,30 @@ const TOOLS: Tool[] = [
 			}
 
 			await writeFile(localPath, buffer);
-			return `Image downloaded to: ${localPath}\nName: ${file.name}\nType: ${file.mimetype}\nSize: ${file.size} bytes`;
+			return `File downloaded to: ${localPath}\nName: ${file.name}\nType: ${file.mimetype}\nSize: ${file.size} bytes`;
 		},
 	},
 	{
-		name: "upload_snippet",
-		description: "Upload a text snippet/file to Slack (up to ~1MB).",
+		name: "upload_text",
+		description:
+			"Upload text content (held in memory) to Slack as a file. Distinct from `upload_file` which reads from disk. Use for code snippets, logs, JSON dumps, anything you want to share as an attached file without first writing to disk. Up to ~1MB. Renders in Slack with syntax highlighting based on the filename extension.",
 		inputSchema: {
 			type: "object",
 			properties: {
 				channel: { type: "string", description: "Channel ID." },
 				content: { type: "string", description: "Text content to upload." },
-				filename: { type: "string", description: "Filename (e.g. 'code.js')." },
+				filename: {
+					type: "string",
+					description:
+						"Filename including extension (e.g. 'code.js', 'log.txt'). Slack uses the extension for syntax highlighting.",
+				},
 				title: { type: "string", description: "Title (default: filename)." },
 				thread_ts: { type: "string", description: "Thread ts." },
 			},
 			required: ["channel", "content", "filename"],
 		},
 		handler: async (_session, args) => {
-			const snippetTitle = args.title || args.filename;
+			const title = args.title || args.filename;
 			const contentLength = Buffer.byteLength(args.content, "utf-8");
 			const urlRes = await slack.files.getUploadURLExternal({
 				filename: args.filename,
@@ -944,11 +963,11 @@ const TOOLS: Tool[] = [
 				throw new Error(`Upload failed: ${upload.statusText}`);
 			}
 			await slack.files.completeUploadExternal({
-				files: [{ id: urlRes.file_id, title: snippetTitle }],
+				files: [{ id: urlRes.file_id, title }],
 				channel_id: args.channel,
 				thread_ts: args.thread_ts,
 			});
-			return `Snippet uploaded: ${args.filename} (${contentLength} bytes)`;
+			return `Text uploaded as ${args.filename} (${contentLength} bytes)`;
 		},
 	},
 
@@ -1197,7 +1216,7 @@ function buildSessionServer(): {
 	});
 
 	const server = new Server(
-		{ name: `slack-bus-${INSTANCE}`, version: "0.4.0" },
+		{ name: `slack-bus-${INSTANCE}`, version: "0.5.0" },
 		{
 			capabilities: {
 				experimental: { "claude/channel": {} },
