@@ -197,8 +197,13 @@ type Session = {
 	id: string;
 	server: Server;
 	transport: WebStandardStreamableHTTPServerTransport;
-	threads: Set<string>; // "channel:thread_ts"
-	channels: Set<string>; // "channel"
+	// Value is expiresAt (epoch ms) for TTL'd subs, or null for session-lifetime.
+	threads: Map<string, number | null>; // "channel:thread_ts" → expiresAt|null
+	channels: Map<string, number | null>; // "channel" → expiresAt|null
+	// Bumped on every HTTP request routed to this session. The idle reaper
+	// uses it to drop sessions the client has abandoned without sending DELETE
+	// (which is what real MCP clients like Claude Code do today — see DIG-203).
+	lastSeen: number;
 };
 
 const sessions = new Map<string, Session>();
@@ -206,6 +211,41 @@ const sessions = new Map<string, Session>();
 function threadKey(channel: string, ts: string): string {
 	return `${channel}:${ts}`;
 }
+
+// Convert an optional ttl_seconds tool parameter into an expiresAt timestamp.
+// Returns null for session-lifetime (omitted or non-positive).
+function ttlToExpiresAt(ttlSeconds: unknown): number | null {
+	if (typeof ttlSeconds !== "number" || !Number.isFinite(ttlSeconds) || ttlSeconds <= 0) {
+		return null;
+	}
+	return Date.now() + Math.floor(ttlSeconds * 1000);
+}
+
+// True if the sub key exists in the map AND is not expired. The reaper handles
+// actual deletion of expired entries; routing just skips them.
+function hasActiveSub(map: Map<string, number | null>, key: string): boolean {
+	if (!map.has(key)) return false;
+	const exp = map.get(key)!;
+	return exp === null || exp > Date.now();
+}
+
+// ─── Subscription / session lifecycle reaper ──────────────────────────────────
+// Sweeps every minute: drops individually-expired subs from each session, then
+// reaps sessions that have been idle longer than IDLE_REAP_MS (the client is
+// almost certainly dead — Claude Code doesn't send MCP DELETE on exit, so the
+// transport's onsessionclosed never fires). 24h is loose by design; tighten
+// once we have observability on false-reap rate.
+
+const IDLE_REAP_MS = (() => {
+	const fromEnv = Number(process.env.SLACK_BUS_IDLE_REAP_SECONDS);
+	if (Number.isFinite(fromEnv) && fromEnv > 0) return Math.floor(fromEnv * 1000);
+	return 24 * 60 * 60 * 1000;
+})();
+const REAPER_INTERVAL_MS = (() => {
+	const fromEnv = Number(process.env.SLACK_BUS_REAPER_INTERVAL_SECONDS);
+	if (Number.isFinite(fromEnv) && fromEnv > 0) return Math.floor(fromEnv * 1000);
+	return 60 * 1000;
+})();
 
 // Slack inbound event router. Same logic as the unix-socket bus, but pushes
 // via the per-session MCP transport instead of a socket frame.
@@ -227,9 +267,9 @@ slackApp.message(async ({ message }) => {
 
 	const matches: Array<{ session: Session; kind: "thread_reply" | "channel_message" }> = [];
 	for (const session of sessions.values()) {
-		if (tKey && session.threads.has(tKey)) {
+		if (tKey && hasActiveSub(session.threads, tKey)) {
 			matches.push({ session, kind: "thread_reply" });
-		} else if (session.channels.has(channelId)) {
+		} else if (hasActiveSub(session.channels, channelId)) {
 			matches.push({ session, kind: "channel_message" });
 		}
 	}
@@ -299,7 +339,7 @@ async function routeReactionEvent(
 
 	const matches: Session[] = [];
 	for (const session of sessions.values()) {
-		if (session.threads.has(tKey) || session.channels.has(channelId)) {
+		if (hasActiveSub(session.threads, tKey) || hasActiveSub(session.channels, channelId)) {
 			matches.push(session);
 		}
 	}
@@ -367,7 +407,7 @@ const TOOLS: Tool[] = [
 	{
 		name: "post_message",
 		description:
-			"Post a message to a Slack channel or thread. Accepts Block Kit blocks for rich content; pass `text` as a notification fallback. When posting top-level (no thread_ts), this session is auto-subscribed to BOTH replies in the resulting thread AND reactions on the posted message — they'll arrive as `notifications/claude/channel` system reminders (kinds `thread_reply`, `reaction`, `reaction_removed`).",
+			"Post a message to a Slack channel or thread. Accepts Block Kit blocks for rich content; pass `text` as a notification fallback. When posting top-level (no thread_ts), this session is auto-subscribed to BOTH replies in the resulting thread AND reactions on the posted message — they'll arrive as `notifications/claude/channel` system reminders (kinds `thread_reply`, `reaction`, `reaction_removed`). The auto-subscription lives for the session unless you bound it with `ttl_seconds`.",
 		inputSchema: {
 			type: "object",
 			properties: {
@@ -393,12 +433,18 @@ const TOOLS: Tool[] = [
 					description:
 						"Default true for top-level posts (subscribes this session to replies). Set false to post without subscribing.",
 				},
+				ttl_seconds: {
+					type: "number",
+					description:
+						"Bound the auto-subscription's lifetime to this many seconds. Omit (or pass <=0) for session-lifetime. Has no effect when auto_subscribe is false or thread_ts is set.",
+				},
 			},
 			required: ["channel"],
 		},
 		handler: async (session, args) => {
 			const { channel, blocks, text, thread_ts, unfurl_links, unfurl_media } = args;
 			const auto = args.auto_subscribe !== false;
+			const expiresAt = ttlToExpiresAt(args.ttl_seconds);
 
 			if ((!blocks || blocks.length === 0) && !text) {
 				throw new Error("post_message requires either `blocks` or `text`.");
@@ -417,9 +463,10 @@ const TOOLS: Tool[] = [
 
 			let note = `Posted. channel=${channel} ts=${ts}`;
 			if (!thread_ts && auto) {
-				session.threads.add(threadKey(channel, ts));
-				note += `. Auto-subscribed to replies in this thread.`;
-				log(`session ${session.id} posted to ${channel}, auto-subscribed to thread ${ts}`);
+				session.threads.set(threadKey(channel, ts), expiresAt);
+				const ttlNote = expiresAt === null ? "" : ` (expires in ${Math.round((expiresAt - Date.now()) / 1000)}s)`;
+				note += `. Auto-subscribed to replies in this thread${ttlNote}.`;
+				log(`session ${session.id} posted to ${channel}, auto-subscribed to thread ${ts}${expiresAt === null ? "" : ` ttl=${args.ttl_seconds}s`}`);
 			} else if (thread_ts) {
 				note += ` (in thread ${thread_ts})`;
 				log(`session ${session.id} replied in ${channel}/${thread_ts} (ts ${ts})`);
@@ -498,38 +545,52 @@ const TOOLS: Tool[] = [
 	{
 		name: "subscribe_channel",
 		description:
-			"Subscribe this session to ALL new messages in a channel. Each new message arrives as a `notifications/claude/channel` system reminder with kind=channel_message. Session-scoped — dies when this session ends.",
+			"Subscribe this session to ALL new messages in a channel. Each new message arrives as a `notifications/claude/channel` system reminder with kind=channel_message. Defaults to session-lifetime; pass `ttl_seconds` to bound the window.",
 		inputSchema: {
 			type: "object",
 			properties: {
 				channel_id: { type: "string", description: "Channel ID to subscribe to." },
+				ttl_seconds: {
+					type: "number",
+					description:
+						"How long the subscription stays active (seconds). Omit (or pass <=0) for session-lifetime. Useful when you only need to watch a channel for a bounded window — the bus drops the sub automatically when it expires, no unsubscribe call needed.",
+				},
 			},
 			required: ["channel_id"],
 		},
 		handler: async (session, args) => {
-			session.channels.add(args.channel_id);
-			log(`session ${session.id} subscribed to channel ${args.channel_id} (now ${session.channels.size})`);
-			return `Subscribed to channel ${args.channel_id} for the lifetime of this session.`;
+			const expiresAt = ttlToExpiresAt(args.ttl_seconds);
+			session.channels.set(args.channel_id, expiresAt);
+			const ttlNote = expiresAt === null ? "for the lifetime of this session" : `for ${Math.round((expiresAt - Date.now()) / 1000)}s`;
+			log(`session ${session.id} subscribed to channel ${args.channel_id} ${ttlNote} (now ${session.channels.size})`);
+			return `Subscribed to channel ${args.channel_id} ${ttlNote}.`;
 		},
 	},
 	{
 		name: "subscribe_thread",
 		description:
-			"Subscribe this session to replies in a specific thread. Use when you want to follow a thread you didn't post yourself. Replies arrive as `notifications/claude/channel` reminders with kind=thread_reply.",
+			"Subscribe this session to replies in a specific thread. Use when you want to follow a thread you didn't post yourself. Replies arrive as `notifications/claude/channel` reminders with kind=thread_reply. Defaults to session-lifetime; pass `ttl_seconds` to bound the window.",
 		inputSchema: {
 			type: "object",
 			properties: {
 				channel_id: { type: "string", description: "Channel ID." },
 				thread_ts: { type: "string", description: "Thread parent message ts." },
+				ttl_seconds: {
+					type: "number",
+					description:
+						"How long the subscription stays active (seconds). Omit (or pass <=0) for session-lifetime. The bus drops the sub automatically when it expires.",
+				},
 			},
 			required: ["channel_id", "thread_ts"],
 		},
 		handler: async (session, args) => {
-			session.threads.add(threadKey(args.channel_id, args.thread_ts));
+			const expiresAt = ttlToExpiresAt(args.ttl_seconds);
+			session.threads.set(threadKey(args.channel_id, args.thread_ts), expiresAt);
+			const ttlNote = expiresAt === null ? "for the lifetime of this session" : `for ${Math.round((expiresAt - Date.now()) / 1000)}s`;
 			log(
-				`session ${session.id} subscribed to thread ${args.channel_id}/${args.thread_ts} (now ${session.threads.size})`,
+				`session ${session.id} subscribed to thread ${args.channel_id}/${args.thread_ts} ${ttlNote} (now ${session.threads.size})`,
 			);
-			return `Subscribed to thread ${args.channel_id}/${args.thread_ts}.`;
+			return `Subscribed to thread ${args.channel_id}/${args.thread_ts} ${ttlNote}.`;
 		},
 	},
 
@@ -1145,7 +1206,7 @@ const TOOLS: Tool[] = [
 	{
 		name: "bus_status",
 		description:
-			"Inspect the slack-bus daemon's current state: instance, uptime, bot identity, all active sessions and their subscriptions (channels + threads). Use to diagnose 'did my notification arrive?' or to confirm which subscriptions this session currently holds. The caller's session is flagged with `is_self: true`.",
+			"Inspect the slack-bus daemon's current state: instance, uptime, bot identity, all active sessions and their subscriptions (channels + threads). Each subscription reports `expires_in_seconds` (null = session-lifetime). Each session reports `idle_seconds` (time since last HTTP request from this client) — sessions exceeding the idle threshold are reaped by the daemon. Use to diagnose 'did my notification arrive?' or to confirm which subscriptions this session currently holds. The caller's session is flagged with `is_self: true`.",
 		inputSchema: {
 			type: "object",
 			properties: {
@@ -1161,20 +1222,28 @@ const TOOLS: Tool[] = [
 			const myId = await getBotUserId();
 			const allSessions = Array.from(sessions.values());
 			const visible = includeOthers ? allSessions : allSessions.filter((s) => s.id === session.id);
+			const now = Date.now();
+
+			const subToObj = ([key, expiresAt]: [string, number | null]) => ({
+				key,
+				expires_in_seconds: expiresAt === null ? null : Math.max(0, Math.round((expiresAt - now) / 1000)),
+			});
 
 			const out = {
 				instance: INSTANCE,
 				port: PORT,
 				bot_user_id: myId,
-				uptime_seconds: Math.floor((Date.now() - BOOT_TIME_MS) / 1000),
+				uptime_seconds: Math.floor((now - BOOT_TIME_MS) / 1000),
+				idle_reap_seconds: Math.floor(IDLE_REAP_MS / 1000),
 				current_session_id: session.id,
 				session_count: allSessions.length,
 				visible_session_count: visible.length,
 				sessions: visible.map((s) => ({
 					id: s.id,
 					is_self: s.id === session.id,
-					channels: Array.from(s.channels),
-					threads: Array.from(s.threads),
+					idle_seconds: Math.floor((now - s.lastSeen) / 1000),
+					channels: Array.from(s.channels).map(subToObj),
+					threads: Array.from(s.threads).map(subToObj),
 				})),
 			};
 			return JSON.stringify(out, null, 2);
@@ -1199,8 +1268,9 @@ function buildSessionServer(): {
 				id: sid,
 				server,
 				transport,
-				threads: new Set(),
-				channels: new Set(),
+				threads: new Map(),
+				channels: new Map(),
+				lastSeen: Date.now(),
 			};
 			sessions.set(sid, session);
 		},
@@ -1216,7 +1286,7 @@ function buildSessionServer(): {
 	});
 
 	const server = new Server(
-		{ name: `slack-bus-${INSTANCE}`, version: "0.5.0" },
+		{ name: `slack-bus-${INSTANCE}`, version: "0.6.0" },
 		{
 			capabilities: {
 				experimental: { "claude/channel": {} },
@@ -1290,10 +1360,14 @@ Bun.serve({
 
 		const sessionId = req.headers.get("mcp-session-id") ?? undefined;
 
-		// Existing session: route to its transport.
+		// Existing session: route to its transport, bump lastSeen so the idle
+		// reaper doesn't kill us. Any HTTP request to this session counts as
+		// liveness — initialize, tool calls, the long-lived GET SSE stream.
 		if (sessionId && sessions.has(sessionId)) {
+			const s = sessions.get(sessionId)!;
+			s.lastSeen = Date.now();
 			log(`req method=${req.method} session=${sessionId.slice(0, 8)}…`);
-			return sessions.get(sessionId)!.transport.handleRequest(req);
+			return s.transport.handleRequest(req);
 		}
 
 		// New session: only valid on POST (initialize). Build a transport+server pair.
@@ -1306,6 +1380,53 @@ Bun.serve({
 		return transport.handleRequest(req);
 	},
 });
+
+// ─── Idle reaper ──────────────────────────────────────────────────────────────
+// Sweeps every REAPER_INTERVAL_MS:
+//   1. Prune individually-expired subscriptions (TTL'd subs whose deadline passed).
+//   2. Drop sessions that have been idle longer than IDLE_REAP_MS — these are
+//      almost certainly clients that exited without sending MCP DELETE
+//      (see DIG-203). The transport.close() call is best-effort; if the
+//      underlying SSE stream is already dead, the throw is expected.
+setInterval(() => {
+	const now = Date.now();
+	for (const session of Array.from(sessions.values())) {
+		let droppedSubs = 0;
+		for (const [k, exp] of session.threads) {
+			if (exp !== null && exp <= now) {
+				session.threads.delete(k);
+				droppedSubs++;
+			}
+		}
+		for (const [k, exp] of session.channels) {
+			if (exp !== null && exp <= now) {
+				session.channels.delete(k);
+				droppedSubs++;
+			}
+		}
+		if (droppedSubs > 0) {
+			log(`reaper: session ${session.id} dropped ${droppedSubs} expired sub(s)`);
+		}
+
+		if (now - session.lastSeen > IDLE_REAP_MS) {
+			const idleHours = ((now - session.lastSeen) / 3_600_000).toFixed(1);
+			log(
+				`session reaped (idle ${idleHours}h): ${session.id}, dropping ${session.threads.size} thread + ${session.channels.size} channel sub(s)`,
+			);
+			sessions.delete(session.id);
+			// Best-effort: tell the transport to close. The underlying SSE
+			// stream is usually already dead at this point, so both sync
+			// throws and async rejections are expected and swallowed.
+			try {
+				Promise.resolve(session.transport.close?.()).catch(() => {
+					// intentional no-op — transport already torn down
+				});
+			} catch {
+				// intentional no-op — close() threw synchronously
+			}
+		}
+	}
+}, REAPER_INTERVAL_MS);
 
 // ─── Start ────────────────────────────────────────────────────────────────────
 
