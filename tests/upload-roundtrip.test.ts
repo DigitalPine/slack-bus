@@ -1,5 +1,5 @@
 /**
- * Round-trip: upload_image → get_image_from_slack → byte-match.
+ * Round-trip: upload_file → get_file_from_slack → byte-match.
  *
  * The cheapest high-confidence smoke test for the file API pair. Catches
  * regressions in either tool, the SDK plumbing, or notification framing.
@@ -16,7 +16,7 @@ import { tryConnectMcp } from "./lib/mcp-http-client";
 const URL = process.env.SLACK_BUS_TEST_URL ?? "http://localhost:42001/mcp";
 const FIXTURE = `${import.meta.dir}/fixtures/pixel.png`;
 
-describe("upload_image ↔ get_image_from_slack", () => {
+describe("upload_file ↔ get_file_from_slack", () => {
 	it("round-trips bytes through Slack file storage", async () => {
 		const client = await tryConnectMcp(URL);
 		if (!client) {
@@ -25,7 +25,7 @@ describe("upload_image ↔ get_image_from_slack", () => {
 		}
 
 		// Upload (no channel — just stage the file, get an ID back).
-		const uploadText = await client.callTool("upload_image", {
+		const uploadText = await client.callTool("upload_file", {
 			file_path: FIXTURE,
 			title: "roundtrip-test",
 		});
@@ -33,10 +33,10 @@ describe("upload_image ↔ get_image_from_slack", () => {
 		expect(fileId).toBeDefined();
 
 		// Download.
-		const downloadText = await client.callTool("get_image_from_slack", {
+		const downloadText = await client.callTool("get_file_from_slack", {
 			file_id: fileId!,
 		});
-		const localPath = downloadText.match(/Image downloaded to: (\/\S+)/)?.[1];
+		const localPath = downloadText.match(/File downloaded to: (\/\S+)/)?.[1];
 		expect(localPath).toBeDefined();
 
 		// Byte-match.
@@ -60,8 +60,9 @@ describe("upload_image ↔ get_image_from_slack", () => {
 		// will change as reactions/bus_status land.
 		const expected = [
 			"post_message",
-			"upload_image",
-			"get_image_from_slack",
+			"upload_file",
+			"upload_text",
+			"get_file_from_slack",
 			"get_channel_context",
 			"subscribe_channel",
 			"subscribe_thread",

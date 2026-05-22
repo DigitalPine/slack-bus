@@ -47,7 +47,7 @@ oauth_config:
       # User lookups (for resolving names in inbound events)
       - users:read
 
-      # File operations (upload_image, upload_snippet, get_image_from_slack)
+      # File operations (upload_file, upload_text, get_file_from_slack — any file type)
       - files:write
       - files:read
 

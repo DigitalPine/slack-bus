@@ -144,7 +144,7 @@ That's the leverage. Slack messages are compressed by nature — short, fragment
 
 ## Tool surface
 
-22 tools as of v0.4.0. Defined inline in `bus-mcp.ts` under `const TOOLS` — adding one is appending an entry to that array.
+22 tools as of v0.5.0. Defined inline in `bus-mcp.ts` under `const TOOLS` — adding one is appending an entry to that array.
 
 **Messaging** — `post_message`, `update_message`, `delete_message`, `add_reaction`. `post_message` accepts Block Kit `blocks` for rich layouts and `text` as a notification fallback.
 
@@ -156,7 +156,7 @@ That's the leverage. Slack messages are compressed by nature — short, fragment
 
 **Channel management** — `create_channel`, `join_channel`, `invite_users`, `pin_message`.
 
-**Files** — `upload_image` (PNG/JPEG/JPG/GIF; with `channel` it posts, without it returns a file ID for Block Kit `image` blocks), `upload_snippet` (text file up to ~1MB), `get_image_from_slack` (download by file ID).
+**Files** — `upload_file` (any file type — images, mp4/mov video, audio, PDF; Slack inline-renders most), `upload_text` (in-memory text content as an attached file with syntax highlighting), `get_file_from_slack` (download by file ID).
 
 **Lookups** — `get_channel_context` (recent messages with user names resolved; `thread_ts` scopes to a thread's replies), `get_user_info`, `list_channels`, `list_users`. Most lookup tools accept `format: "compact"` (default) to strip Slack API bloat.
 
