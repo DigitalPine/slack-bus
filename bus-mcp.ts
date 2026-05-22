@@ -36,6 +36,8 @@ import { readFile, writeFile } from "node:fs/promises";
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
+const VERSION = "0.6.1";
+
 const INSTANCE = process.env.SLACK_BUS_INSTANCE;
 if (!INSTANCE) {
 	throw new Error(
@@ -62,6 +64,46 @@ function log(msg: string) {
 	} catch {}
 	process.stdout.write(line);
 }
+
+// logError prefixes the message with `ERROR ` so log triage is a single grep
+// away. Use for anything an operator should notice — tool failures, Slack API
+// errors, process-level unhandled events.
+function logError(msg: string) {
+	log(`ERROR ${msg}`);
+}
+
+// Truncate-but-readable serialization for arg dicts in error logs. Tool args
+// may contain Block Kit blocks or long text; we don't want a single error
+// line to be 4KB. 240 chars is enough to see channel/ts/key fields.
+function inspectArgs(args: unknown): string {
+	try {
+		const json = JSON.stringify(args);
+		if (!json) return "(none)";
+		return json.length > 240 ? `${json.slice(0, 237)}...` : json;
+	} catch {
+		return "(unserializable)";
+	}
+}
+
+// ─── Process-level safety net ─────────────────────────────────────────────────
+// Without these, an uncaughtException or unhandledRejection inside a tool
+// handler, the slackApp event loop, or any setImmediate would either kill the
+// process silently (Node default in older versions) or spew to stderr where
+// nothing collects it. Funnel everything into our log file so a post-mortem
+// is one `grep ERROR` away.
+
+process.on("uncaughtException", (err) => {
+	logError(`uncaughtException: ${err?.stack ?? err}`);
+});
+process.on("unhandledRejection", (reason) => {
+	const msg =
+		reason instanceof Error
+			? (reason.stack ?? reason.message)
+			: typeof reason === "object"
+				? JSON.stringify(reason)
+				: String(reason);
+	logError(`unhandledRejection: ${msg}`);
+});
 
 // ─── Caches ───────────────────────────────────────────────────────────────────
 // Light TTL+LRU caches for stable lookups (users, channels).
@@ -157,6 +199,12 @@ const slackApp = new App({
 });
 const slack = slackApp.client;
 
+// Catch errors that escape individual event handlers. Without this, Bolt
+// errors land in its own logger and bypass our log file entirely.
+slackApp.error(async (err) => {
+	logError(`slackApp.error: ${err?.stack ?? err}`);
+});
+
 let botUserId: string | undefined;
 async function getBotUserId(): Promise<string> {
 	if (!botUserId) {
@@ -174,7 +222,13 @@ async function getChannelName(channelId: string): Promise<string> {
 		const ch = info.channel;
 		if (ch?.id) channelCache.set(ch.id, ch);
 		return ch?.name ?? channelId;
-	} catch {
+	} catch (err) {
+		const msg = err instanceof Error ? err.message : String(err);
+		// channel_not_found is the boring case (bot doesn't have access). Log
+		// anything else so we notice when Slack lookups break in production.
+		if (!msg.includes("channel_not_found")) {
+			logError(`getChannelName(${channelId}) failed: ${msg}`);
+		}
 		return channelId;
 	}
 }
@@ -186,7 +240,11 @@ async function getUserName(userId: string): Promise<string> {
 		const info = await slack.users.info({ user: userId });
 		if (info.user) userCache.set(userId, info.user);
 		return info.user?.real_name ?? info.user?.profile?.real_name ?? info.user?.name ?? userId;
-	} catch {
+	} catch (err) {
+		const msg = err instanceof Error ? err.message : String(err);
+		if (!msg.includes("user_not_found")) {
+			logError(`getUserName(${userId}) failed: ${msg}`);
+		}
 		return userId;
 	}
 }
@@ -1286,7 +1344,7 @@ function buildSessionServer(): {
 	});
 
 	const server = new Server(
-		{ name: `slack-bus-${INSTANCE}`, version: "0.6.0" },
+		{ name: `slack-bus-${INSTANCE}`, version: VERSION },
 		{
 			capabilities: {
 				experimental: { "claude/channel": {} },
@@ -1321,12 +1379,15 @@ function buildSessionServer(): {
 			// transport (initialize always precedes call), but handle defensively.
 			throw new Error("session not initialized");
 		}
+		const args = req.params.arguments ?? {};
 		try {
-			const text = await tool.handler(session, (req.params.arguments ?? {}) as any);
+			const text = await tool.handler(session, args as any);
 			return { content: [{ type: "text", text }] };
 		} catch (err) {
 			const msg = err instanceof Error ? err.message : String(err);
-			log(`tool ${tool.name} error in session ${session.id}: ${msg}`);
+			logError(
+				`tool=${tool.name} session=${session.id.slice(0, 8)} args=${inspectArgs(args)} err=${msg}`,
+			);
 			return {
 				content: [{ type: "text", text: `Error: ${msg}` }],
 				isError: true,
@@ -1409,9 +1470,13 @@ setInterval(() => {
 		}
 
 		if (now - session.lastSeen > IDLE_REAP_MS) {
-			const idleHours = ((now - session.lastSeen) / 3_600_000).toFixed(1);
+			const idleMs = now - session.lastSeen;
+			const idleStr =
+				idleMs < 3_600_000
+					? `${Math.floor(idleMs / 1000)}s`
+					: `${(idleMs / 3_600_000).toFixed(1)}h`;
 			log(
-				`session reaped (idle ${idleHours}h): ${session.id}, dropping ${session.threads.size} thread + ${session.channels.size} channel sub(s)`,
+				`session reaped (idle ${idleStr}): ${session.id}, dropping ${session.threads.size} thread + ${session.channels.size} channel sub(s)`,
 			);
 			sessions.delete(session.id);
 			// Best-effort: tell the transport to close. The underlying SSE
@@ -1430,10 +1495,22 @@ setInterval(() => {
 
 // ─── Start ────────────────────────────────────────────────────────────────────
 
+// Visual separator + key facts. When the log spans multiple restarts (which
+// it always does, since /tmp/slack-bus-*.log isn't rotated), this banner is
+// the easiest way to find the boot you care about.
+log("═".repeat(72));
+log(
+	`slack-bus v${VERSION} starting — instance=${INSTANCE} port=${PORT} pid=${process.pid} bun=${process.versions.bun ?? "?"}`,
+);
+log(
+	`config — idle_reap=${IDLE_REAP_MS / 1000}s reaper_interval=${REAPER_INTERVAL_MS / 1000}s log=${LOG_FILE}`,
+);
+
 await slackApp.start();
 const myId = await getBotUserId();
 log(`Slack Socket Mode connected. bot_user_id=${myId}`);
 log(`listening on http://localhost:${PORT}/mcp`);
+log(`slack-bus v${VERSION} ready`);
 
 function shutdown(sig: string) {
 	log(`received ${sig}, shutting down`);
