@@ -2,6 +2,29 @@
 
 All notable changes to slack-bus. Dates are when the version landed on `main`.
 
+## 0.6.2 — 2026-05-25 — Actionable error states
+
+When a tool failed, the consuming agent got a generic `Error: <message>`
+with no way to tell a transient failure from a permanent one. An agent
+driving a scheduled post would either give up on a blip or loop on a
+broken token. ([DIG-218](https://linear.app/digital-pine/issue/DIG-218))
+
+- **`classifyError()` buckets failures** into `unreachable`,
+  `rate_limited`, `auth`, `api`, and `unknown`, each with an actionable,
+  retry-aware message. Duck-typed on `@slack/web-api`'s `WebAPICallError`
+  shape (`err.code` + `err.data.error`) so a web-api version bump can't
+  silently break classification.
+  - `unreachable` (network/DNS, HTTP 5xx) → "safe to retry shortly."
+  - `rate_limited` → "retry after Ns" using Slack's `retryAfter`.
+  - `auth` (invalid/revoked/expired token, missing scope) → "will NOT
+    resolve on retry — do not loop."
+  - `api` (channel_not_found, etc.) → surfaced cleanly; already actionable.
+- **Error log lines now carry `category=`** for one-grep triage of
+  what class of failure a session hit.
+- **Scope note:** a dead MCP *transport* (Claude Code can't reach the
+  daemon) surfaces client-side as an "unhealthy" server and never reaches
+  this handler — this classifier covers only the daemon-to-Slack leg.
+
 ## 0.6.1 — 2026-05-22 — Operational polish
 
 The first "prototype → daily tool" pass. Focus is making the daemon

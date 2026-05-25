@@ -33,10 +33,11 @@ import type {
 import { randomUUID } from "node:crypto";
 import { appendFileSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
+import { classifyError } from "./classify-error.ts";
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
-const VERSION = "0.6.1";
+const VERSION = "0.6.2";
 
 const INSTANCE = process.env.SLACK_BUS_INSTANCE;
 if (!INSTANCE) {
@@ -1384,12 +1385,12 @@ function buildSessionServer(): {
 			const text = await tool.handler(session, args as any);
 			return { content: [{ type: "text", text }] };
 		} catch (err) {
-			const msg = err instanceof Error ? err.message : String(err);
+			const { category, message } = classifyError(err);
 			logError(
-				`tool=${tool.name} session=${session.id.slice(0, 8)} args=${inspectArgs(args)} err=${msg}`,
+				`tool=${tool.name} session=${session.id.slice(0, 8)} category=${category} args=${inspectArgs(args)} err=${message}`,
 			);
 			return {
-				content: [{ type: "text", text: `Error: ${msg}` }],
+				content: [{ type: "text", text: `Error: ${message}` }],
 				isError: true,
 			};
 		}
