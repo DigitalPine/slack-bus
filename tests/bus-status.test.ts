@@ -29,7 +29,14 @@ describe("bus_status", () => {
 			uptime_seconds: number;
 			current_session_id: string;
 			session_count: number;
-			sessions: Array<{ id: string; is_self: boolean; channels: string[]; threads: string[] }>;
+			slack: { connected: boolean; state: string };
+			sessions: Array<{
+				id: string;
+				is_self: boolean;
+				// Since v0.6.0 each sub is {key, expires_in_seconds}, not a bare string.
+				channels: Array<{ key: string; expires_in_seconds: number | null }>;
+				threads: Array<{ key: string; expires_in_seconds: number | null }>;
+			}>;
 		};
 
 		expect(typeof status.instance).toBe("string");
@@ -39,10 +46,14 @@ describe("bus_status", () => {
 		expect(status.current_session_id).toBe(client.sessionId);
 		expect(status.session_count).toBeGreaterThanOrEqual(1);
 
+		// Slack connectivity block (v0.6.3).
+		expect(typeof status.slack.connected).toBe("boolean");
+		expect(typeof status.slack.state).toBe("string");
+
 		const self = status.sessions.find((s) => s.is_self);
 		expect(self).toBeDefined();
 		expect(self!.id).toBe(client.sessionId);
-		expect(self!.channels).toContain(fakeChannel);
+		expect(self!.channels.map((c) => c.key)).toContain(fakeChannel);
 
 		client.close();
 	});
