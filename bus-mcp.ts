@@ -37,7 +37,7 @@ import { classifyError } from "./classify-error.ts";
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
-const VERSION = "0.6.2";
+const VERSION = "0.6.3";
 
 const INSTANCE = process.env.SLACK_BUS_INSTANCE;
 if (!INSTANCE) {
@@ -205,6 +205,85 @@ const slack = slackApp.client;
 slackApp.error(async (err) => {
 	logError(`slackApp.error: ${err?.stack ?? err}`);
 });
+
+// ─── Slack connectivity tracking ──────────────────────────────────────────────
+// Mirror the Socket Mode connection state so bus_status (and an operator
+// grepping the log) can tell whether the daemon's INBOUND link to Slack is up.
+//
+// Scope caveat: this is the daemon→Slack inbound websocket only — it carries
+// replies/reactions. OUTBOUND posting (chat.postMessage) goes over the Web API
+// independently and is NOT represented here; a post can succeed while the
+// socket is mid-reconnect, and vice versa. Outbound failures surface per-call
+// via classifyError(). And neither leg is the client→daemon MCP transport,
+// whose failure shows up client-side as an "unhealthy" server, never here.
+//
+// Socket Mode rotates connections routinely (Slack recycles the websocket every
+// so often), so a `disconnected`/`reconnecting` cycle is normal churn, not an
+// outage. We log it at info level and never raise ERROR for it — a real outage
+// shows up as the state sticking off "connected" with a growing
+// seconds_since_last_event in bus_status.
+
+const socketHealth = {
+	state: "starting", // last Socket Mode state seen
+	connected: false,
+	lastEventAt: Date.now(),
+	lastConnectedAt: null as number | null,
+	lastDisconnectedAt: null as number | null,
+	connectCount: 0,
+	disconnectCount: 0,
+};
+
+function attachSocketHealthListeners() {
+	// Bolt's SocketModeReceiver holds the SocketModeClient (an EventEmitter) at
+	// `.client`. Duck-typed so a Bolt internals shuffle degrades gracefully
+	// rather than crashing the daemon.
+	const socketClient = (slackApp as any).receiver?.client;
+	if (!socketClient || typeof socketClient.on !== "function") {
+		logError(
+			"socket health: receiver.client not an EventEmitter — bus_status slack.* will report best-effort 'starting' state",
+		);
+		return;
+	}
+	socketClient.on("connecting", () => {
+		socketHealth.state = "connecting";
+		socketHealth.lastEventAt = Date.now();
+	});
+	socketClient.on("authenticated", () => {
+		socketHealth.state = "authenticated";
+		socketHealth.lastEventAt = Date.now();
+	});
+	socketClient.on("connected", () => {
+		socketHealth.state = "connected";
+		socketHealth.connected = true;
+		socketHealth.lastConnectedAt = Date.now();
+		socketHealth.lastEventAt = Date.now();
+		socketHealth.connectCount += 1;
+		// First connect is logged by the boot sequence; only announce reconnects.
+		if (socketHealth.connectCount > 1) {
+			log(`Socket Mode reconnected (connect #${socketHealth.connectCount})`);
+		}
+	});
+	socketClient.on("reconnecting", () => {
+		socketHealth.state = "reconnecting";
+		socketHealth.connected = false;
+		socketHealth.lastEventAt = Date.now();
+		log("Socket Mode reconnecting");
+	});
+	socketClient.on("disconnecting", () => {
+		socketHealth.state = "disconnecting";
+		socketHealth.connected = false;
+		socketHealth.lastEventAt = Date.now();
+	});
+	socketClient.on("disconnected", () => {
+		socketHealth.state = "disconnected";
+		socketHealth.connected = false;
+		socketHealth.lastDisconnectedAt = Date.now();
+		socketHealth.lastEventAt = Date.now();
+		socketHealth.disconnectCount += 1;
+		log("Socket Mode disconnected");
+	});
+}
+attachSocketHealthListeners();
 
 let botUserId: string | undefined;
 async function getBotUserId(): Promise<string> {
@@ -1265,7 +1344,7 @@ const TOOLS: Tool[] = [
 	{
 		name: "bus_status",
 		description:
-			"Inspect the slack-bus daemon's current state: instance, uptime, bot identity, all active sessions and their subscriptions (channels + threads). Each subscription reports `expires_in_seconds` (null = session-lifetime). Each session reports `idle_seconds` (time since last HTTP request from this client) — sessions exceeding the idle threshold are reaped by the daemon. Use to diagnose 'did my notification arrive?' or to confirm which subscriptions this session currently holds. The caller's session is flagged with `is_self: true`.",
+			"Inspect the slack-bus daemon's current state: instance, uptime, bot identity, Slack connectivity, all active sessions and their subscriptions (channels + threads). The `slack` block reports the INBOUND Socket Mode link (carries replies/reactions): `connected`, `state`, and `seconds_since_last_event` — a healthy link sits in state `connected`; if it sticks off `connected` with a growing `seconds_since_last_event`, inbound is down. Outbound posting uses the Web API independently and is NOT reflected here (post failures surface per-call). Each subscription reports `expires_in_seconds` (null = session-lifetime). Each session reports `idle_seconds` (time since last HTTP request from this client) — sessions exceeding the idle threshold are reaped by the daemon. Use to diagnose 'did my notification arrive?' or to confirm which subscriptions this session currently holds. The caller's session is flagged with `is_self: true`.",
 		inputSchema: {
 			type: "object",
 			properties: {
@@ -1294,6 +1373,23 @@ const TOOLS: Tool[] = [
 				bot_user_id: myId,
 				uptime_seconds: Math.floor((now - BOOT_TIME_MS) / 1000),
 				idle_reap_seconds: Math.floor(IDLE_REAP_MS / 1000),
+				// Inbound Socket Mode link health (replies/reactions). Outbound
+				// posting uses the Web API independently and isn't reflected here.
+				slack: {
+					connected: socketHealth.connected,
+					state: socketHealth.state,
+					seconds_since_last_event: Math.floor((now - socketHealth.lastEventAt) / 1000),
+					last_connected_seconds_ago:
+						socketHealth.lastConnectedAt === null
+							? null
+							: Math.floor((now - socketHealth.lastConnectedAt) / 1000),
+					last_disconnected_seconds_ago:
+						socketHealth.lastDisconnectedAt === null
+							? null
+							: Math.floor((now - socketHealth.lastDisconnectedAt) / 1000),
+					connect_count: socketHealth.connectCount,
+					disconnect_count: socketHealth.disconnectCount,
+				},
 				current_session_id: session.id,
 				session_count: allSessions.length,
 				visible_session_count: visible.length,

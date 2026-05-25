@@ -2,6 +2,31 @@
 
 All notable changes to slack-bus. Dates are when the version landed on `main`.
 
+## 0.6.3 — 2026-05-25 — Slack connectivity in bus_status
+
+The daemon logged "Socket Mode connected" once at boot and then never
+tracked the link again — there was no way to ask "is the bus's link to
+Slack healthy right now?". ([DIG-219](https://linear.app/digital-pine/issue/DIG-219))
+
+- **Socket Mode state tracking.** Listeners on Bolt's `SocketModeClient`
+  (`connecting` / `authenticated` / `connected` / `reconnecting` /
+  `disconnecting` / `disconnected`) mirror the live state into a small
+  struct. Duck-typed on `receiver.client` so a Bolt internals change
+  degrades gracefully instead of crashing the daemon.
+- **`bus_status` now returns a `slack` block:** `connected`, `state`,
+  `seconds_since_last_event`, `last_connected_seconds_ago`,
+  `last_disconnected_seconds_ago`, `connect_count`, `disconnect_count`.
+  A healthy link sits in `connected`; an outage shows as the state
+  sticking off `connected` with a growing `seconds_since_last_event`.
+- **Reconnects are logged at info level, never ERROR.** Socket Mode
+  rotates the websocket routinely — a `disconnected`/`reconnecting` cycle
+  is normal churn, so alarming on it would be noise. Reconnects log
+  `Socket Mode reconnected (connect #N)`.
+- **Scope:** this is the INBOUND leg (replies/reactions) only. Outbound
+  posting (Web API) is independent and surfaces failures per-call via
+  v0.6.2's classifier; the client→daemon MCP transport is a third,
+  separate leg that fails client-side as an "unhealthy" server.
+
 ## 0.6.2 — 2026-05-25 — Actionable error states
 
 When a tool failed, the consuming agent got a generic `Error: <message>`
