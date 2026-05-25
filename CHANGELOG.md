@@ -2,6 +2,17 @@
 
 All notable changes to slack-bus. Dates are when the version landed on `main`.
 
+## 0.6.4 — 2026-05-25 — open_slack tool
+
+- **New tool `open_slack`** (23 tools total). Runs `open -a Slack` on the
+  host Mac to launch or focus the Slack desktop app from a Claude session
+  — a dogfooding convenience. macOS-only (clean error elsewhere); throws
+  with an "is Slack installed?" hint on non-zero exit. The description
+  makes explicit that this touches only the local desktop client and has
+  no bearing on message delivery — a deliberate counter to the Monday
+  incident's mental model, where quitting the desktop app was assumed to
+  have broken the bus. ([DIG-220](https://linear.app/digital-pine/issue/DIG-220))
+
 ## 0.6.3 — 2026-05-25 — Slack connectivity in bus_status
 
 The daemon logged "Socket Mode connected" once at boot and then never

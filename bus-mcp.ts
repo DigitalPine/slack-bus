@@ -37,7 +37,7 @@ import { classifyError } from "./classify-error.ts";
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
-const VERSION = "0.6.3";
+const VERSION = "0.6.4";
 
 const INSTANCE = process.env.SLACK_BUS_INSTANCE;
 if (!INSTANCE) {
@@ -1402,6 +1402,32 @@ const TOOLS: Tool[] = [
 				})),
 			};
 			return JSON.stringify(out, null, 2);
+		},
+	},
+	{
+		name: "open_slack",
+		description:
+			"Launch or focus the Slack desktop app on the host Mac (runs `open -a Slack`). For dogfooding — bring Slack to the foreground from a Claude session. Note: this controls the LOCAL desktop client only and has no bearing on message delivery — the bus talks to Slack's cloud independently of whether the desktop app is open.",
+		inputSchema: { type: "object", properties: {} },
+		handler: async () => {
+			if (process.platform !== "darwin") {
+				throw new Error(
+					`open_slack is macOS-only (host platform is ${process.platform}).`,
+				);
+			}
+			// `open -a` launches the app or focuses it if already running.
+			const proc = Bun.spawn(["open", "-a", "Slack"], {
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			const code = await proc.exited;
+			if (code !== 0) {
+				const stderr = (await new Response(proc.stderr).text()).trim();
+				throw new Error(
+					`open -a Slack failed (exit ${code})${stderr ? `: ${stderr}` : " — is Slack installed?"}`,
+				);
+			}
+			return "Slack desktop app launched/focused.";
 		},
 	},
 ];
