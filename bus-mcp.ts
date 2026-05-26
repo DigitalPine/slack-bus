@@ -34,10 +34,18 @@ import { randomUUID } from "node:crypto";
 import { appendFileSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
 import { classifyError } from "./classify-error.ts";
+import {
+	formatIdle,
+	hasActiveSub,
+	isIdleExpired,
+	pruneExpiredSubs,
+	threadKey,
+	ttlToExpiresAt,
+} from "./lifecycle.ts";
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
-const VERSION = "0.6.4";
+const VERSION = "0.6.5";
 
 const INSTANCE = process.env.SLACK_BUS_INSTANCE;
 if (!INSTANCE) {
@@ -346,26 +354,8 @@ type Session = {
 
 const sessions = new Map<string, Session>();
 
-function threadKey(channel: string, ts: string): string {
-	return `${channel}:${ts}`;
-}
-
-// Convert an optional ttl_seconds tool parameter into an expiresAt timestamp.
-// Returns null for session-lifetime (omitted or non-positive).
-function ttlToExpiresAt(ttlSeconds: unknown): number | null {
-	if (typeof ttlSeconds !== "number" || !Number.isFinite(ttlSeconds) || ttlSeconds <= 0) {
-		return null;
-	}
-	return Date.now() + Math.floor(ttlSeconds * 1000);
-}
-
-// True if the sub key exists in the map AND is not expired. The reaper handles
-// actual deletion of expired entries; routing just skips them.
-function hasActiveSub(map: Map<string, number | null>, key: string): boolean {
-	if (!map.has(key)) return false;
-	const exp = map.get(key)!;
-	return exp === null || exp > Date.now();
-}
+// Pure lifecycle helpers (TTL expiry + idle reaping) live in lifecycle.ts so
+// they're unit-testable without booting the daemon. See tests/lifecycle.test.ts.
 
 // ─── Subscription / session lifecycle reaper ──────────────────────────────────
 // Sweeps every minute: drops individually-expired subs from each session, then
@@ -1575,29 +1565,15 @@ Bun.serve({
 setInterval(() => {
 	const now = Date.now();
 	for (const session of Array.from(sessions.values())) {
-		let droppedSubs = 0;
-		for (const [k, exp] of session.threads) {
-			if (exp !== null && exp <= now) {
-				session.threads.delete(k);
-				droppedSubs++;
-			}
-		}
-		for (const [k, exp] of session.channels) {
-			if (exp !== null && exp <= now) {
-				session.channels.delete(k);
-				droppedSubs++;
-			}
-		}
+		const droppedSubs =
+			pruneExpiredSubs(session.threads, now) +
+			pruneExpiredSubs(session.channels, now);
 		if (droppedSubs > 0) {
 			log(`reaper: session ${session.id} dropped ${droppedSubs} expired sub(s)`);
 		}
 
-		if (now - session.lastSeen > IDLE_REAP_MS) {
-			const idleMs = now - session.lastSeen;
-			const idleStr =
-				idleMs < 3_600_000
-					? `${Math.floor(idleMs / 1000)}s`
-					: `${(idleMs / 3_600_000).toFixed(1)}h`;
+		if (isIdleExpired(session.lastSeen, IDLE_REAP_MS, now)) {
+			const idleStr = formatIdle(now - session.lastSeen);
 			log(
 				`session reaped (idle ${idleStr}): ${session.id}, dropping ${session.threads.size} thread + ${session.channels.size} channel sub(s)`,
 			);

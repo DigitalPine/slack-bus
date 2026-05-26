@@ -2,6 +2,25 @@
 
 All notable changes to slack-bus. Dates are when the version landed on `main`.
 
+## 0.6.5 — 2026-05-25 — Lifecycle logic extracted + unit-tested (no behavior change)
+
+Hardening pass, no functional change. The v0.6.0 lifecycle logic (per-sub
+TTL expiry + idle session reaping) was inline in the daemon and had zero
+pure tests — only live integration tests that *silently pass when no bus is
+running*, which is how a stale assertion went unnoticed for days.
+
+- **`lifecycle.ts`** — extracted `ttlToExpiresAt`, `isExpired`,
+  `hasActiveSub`, `pruneExpiredSubs`, `isIdleExpired`, `formatIdle`,
+  `threadKey` as pure functions with injectable `now` for deterministic
+  time. The idle reaper now routes through `pruneExpiredSubs` /
+  `isIdleExpired` / `formatIdle` instead of inline loops (behavior
+  identical, boundary semantics preserved: TTL expires at `exp <= now`,
+  idle reaps at strict `now - lastSeen > window`).
+- **`tests/lifecycle.test.ts`** — 20+ assertions covering TTL parsing,
+  expiry boundaries, prune counts, idle thresholds, and idle formatting.
+  Runs with no bus, so `bun test` now carries real always-on signal
+  (suite went 13 → 29 passing).
+
 ## 0.6.4 — 2026-05-25 — open_slack tool
 
 - **New tool `open_slack`** (23 tools total). Runs `open -a Slack` on the
