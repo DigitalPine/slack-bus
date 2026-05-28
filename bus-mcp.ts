@@ -34,6 +34,7 @@ import { randomUUID } from "node:crypto";
 import { appendFileSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
 import { classifyError } from "./classify-error.ts";
+import { renderTimestamp } from "./format-time.ts";
 import {
 	formatIdle,
 	hasActiveSub,
@@ -45,7 +46,7 @@ import {
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
-const VERSION = "0.6.5";
+const VERSION = "0.6.6";
 
 const INSTANCE = process.env.SLACK_BUS_INSTANCE;
 if (!INSTANCE) {
@@ -155,6 +156,9 @@ const channelCache = new SimpleCache<any>(200);
 function compactMessage(msg: any) {
 	const out: any = {
 		ts: msg.ts,
+		// Absolute rendering of `ts` so the agent never converts epoch→date in
+		// its head. `ts` stays authoritative for API calls (thread_ts etc.).
+		when: msg.ts ? renderTimestamp(msg.ts) : undefined,
 		text: msg.text ?? "",
 		type: msg.type ?? "message",
 	};
@@ -423,6 +427,7 @@ slackApp.message(async ({ message }) => {
 			channel_id: channelId,
 			channel_name: channelName,
 			ts: m.ts,
+			when: renderTimestamp(m.ts),
 			user_id: m.user,
 			user_name: userName,
 		};
@@ -488,7 +493,7 @@ async function routeReactionEvent(
 			.notification({
 				method: "notifications/claude/channel",
 				params: {
-					content: `Reaction :${event.reaction}: ${verb} by ${userName} on message ts=${itemTs} in ${channelName}.`,
+					content: `Reaction :${event.reaction}: ${verb} by ${userName} at ${renderTimestamp(event.event_ts)} on message ts=${itemTs} in ${channelName}.`,
 					meta: {
 						source: "slack-bus",
 						kind,
@@ -496,8 +501,10 @@ async function routeReactionEvent(
 						channel_name: channelName,
 						reaction: event.reaction,
 						item_ts: itemTs,
+						item_when: renderTimestamp(itemTs),
 						item_user: event.item_user,
 						ts: event.event_ts,
+						when: renderTimestamp(event.event_ts),
 						user_id: event.user,
 						user_name: userName,
 					},
@@ -1167,7 +1174,8 @@ const TOOLS: Tool[] = [
 			"Read Slack conversation history. Two modes:\n\n" +
 				"• **Thread mode** (pass `thread_ts`): returns ONLY that thread's messages — parent + replies. Use this whenever the user references a specific thread or you're responding to a `thread_reply` notification. Look for `meta.thread_ts` in recent `notifications/claude/channel` system reminders, or extract from a Slack thread URL.\n\n" +
 				"• **Channel mode** (omit `thread_ts`): returns recent top-level activity in the channel.\n\n" +
-				"Prefer thread mode any time you have a real `thread_ts` available — channel mode pulls broad noise when you only wanted one conversation. Returns compact JSON with user names resolved.",
+				"Prefer thread mode any time you have a real `thread_ts` available — channel mode pulls broad noise when you only wanted one conversation. Returns compact JSON with user names resolved.\n\n" +
+					"Each message includes `when` — an absolute rendered timestamp (e.g. `2026-05-27 08:54 PDT (Wed)`). Read time from `when`; it is authoritative. Do NOT convert the raw epoch `ts` to a date yourself. `when` is absolute only (no \"today/yesterday\") — compare it against your own known current date to judge recency.",
 		inputSchema: {
 			type: "object",
 			properties: {
@@ -1250,7 +1258,12 @@ const TOOLS: Tool[] = [
 				}),
 			);
 
-			const out = fmt === "compact" ? enriched.map(compactMessage) : enriched;
+			const out =
+				fmt === "compact"
+					? enriched.map(compactMessage)
+					: enriched.map((m: any) =>
+							m.ts ? { ...m, when: renderTimestamp(m.ts) } : m,
+						);
 			return JSON.stringify(out, null, 2);
 		},
 	},
