@@ -2,6 +2,31 @@
 
 All notable changes to slack-bus. Dates are when the version landed on `main`.
 
+## 0.6.6 — 2026-05-28 — Rendered timestamps at every agent boundary
+
+Agents were handed raw Unix epoch timestamps (`"ts": "1779897289.590119"`)
+with no human rendering, forcing epoch→date conversion in-head — an error
+vector that caused a real misread (a batch of prior-day messages read as
+"today", nearly producing a duplicate standup). ([DIG-242](https://linear.app/digital-pine/issue/DIG-242))
+
+- **`format-time.ts`** — pure, unit-tested `renderTimestamp(ts, timeZone?)`
+  that renders a Slack epoch into an absolute, unambiguous string:
+  `2026-05-27 08:54 PDT (Wed)` — date, 24h time, tz abbreviation, weekday.
+  Daemon-local zone by default; unparseable input returns the raw string
+  (never throws).
+- **`when` added alongside (never replacing) the raw `ts`** at every
+  boundary a timestamp crosses to the agent: `get_channel_context` message
+  objects (compact + full), and the inbound `notifications/claude/channel`
+  events (`thread_reply`, `channel_message`, `reaction`/`reaction_removed`,
+  which also gains `item_when` for the reacted message). The raw `ts` stays
+  authoritative for API calls (`thread_ts` etc.).
+- **`get_channel_context` description** now tells the agent `when` is
+  authoritative — read time from it, don't recompute from `ts`.
+- **Deliberately absolute only — no "today/yesterday".** Relative-to-now is
+  a function of the agent's own sense of the current date (a separate
+  concern), not slack-bus's. The agent compares the absolute `when` against
+  its own known current date.
+
 ## 0.6.5 — 2026-05-25 — Lifecycle logic extracted + unit-tested (no behavior change)
 
 Hardening pass, no functional change. The v0.6.0 lifecycle logic (per-sub
