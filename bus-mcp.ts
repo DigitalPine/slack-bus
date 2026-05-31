@@ -82,6 +82,20 @@ function logError(msg: string) {
 	log(`ERROR ${msg}`);
 }
 
+// Channel-notification `meta` MUST be Record<string,string>. Claude Code validates
+// it with Zod and throws an "expected string, received <type>" error INSIDE its
+// notification handler on any non-string value — silently dropping the event before
+// it renders (the daemon still logs the send as OK). Coerce every value to a string
+// and drop null/undefined so a future non-string field can never break delivery.
+function coerceMeta(meta: Record<string, unknown>): Record<string, string> {
+	const out: Record<string, string> = {};
+	for (const [k, v] of Object.entries(meta)) {
+		if (v === undefined || v === null) continue;
+		out[k] = typeof v === "string" ? v : typeof v === "object" ? JSON.stringify(v) : String(v);
+	}
+	return out;
+}
+
 // Truncate-but-readable serialization for arg dicts in error logs. Tool args
 // may contain Block Kit blocks or long text; we don't want a single error
 // line to be 4KB. 240 chars is enough to see channel/ts/key fields.
@@ -438,7 +452,7 @@ slackApp.message(async ({ message }) => {
 				method: "notifications/claude/channel",
 				params: {
 					content: m.text,
-					meta,
+					meta: coerceMeta(meta),
 				},
 			})
 			.then(() =>
@@ -494,7 +508,7 @@ async function routeReactionEvent(
 				method: "notifications/claude/channel",
 				params: {
 					content: `Reaction :${event.reaction}: ${verb} by ${userName} at ${renderTimestamp(event.event_ts)} on message ts=${itemTs} in ${channelName}.`,
-					meta: {
+					meta: coerceMeta({
 						source: "slack-bus",
 						kind,
 						channel_id: channelId,
@@ -507,7 +521,7 @@ async function routeReactionEvent(
 						when: renderTimestamp(event.event_ts),
 						user_id: event.user,
 						user_name: userName,
-					},
+					}),
 				},
 			})
 			.then(() =>
