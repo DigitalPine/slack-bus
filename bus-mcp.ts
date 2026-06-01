@@ -46,7 +46,7 @@ import {
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
-const VERSION = "0.6.6";
+const VERSION = "0.6.7";
 
 const INSTANCE = process.env.SLACK_BUS_INSTANCE;
 if (!INSTANCE) {
@@ -65,6 +65,15 @@ if (!SLACK_APP_TOKEN) throw new Error("SLACK_APP_TOKEN is required");
 
 const BOOT_TIME_MS = Date.now();
 
+// Verbose inbound tracing. OFF by default because slackApp.message fires for
+// EVERY message in EVERY channel the bot is in — logging each arrival/drop
+// unconditionally would flood the log. Flip SLACK_BUS_DEBUG=1 (and restart)
+// when diagnosing "I'm not getting notifications": it makes every inbound
+// event's outcome visible (matched N sessions / 0 sessions / dropped + why),
+// so a single log read localizes the failure (never-arrived vs no-matching-sub
+// vs dead-push-stream). See DIG-280.
+const DEBUG = /^(1|true|yes)$/i.test(process.env.SLACK_BUS_DEBUG ?? "");
+
 const LOG_FILE = `/tmp/slack-bus-${INSTANCE}.log`;
 
 function log(msg: string) {
@@ -82,6 +91,13 @@ function logError(msg: string) {
 	log(`ERROR ${msg}`);
 }
 
+// debug logs are gated by SLACK_BUS_DEBUG (see DEBUG above). Prefixed `DEBUG `
+// so they're a single grep to include or exclude. Use for high-volume inbound
+// tracing that would otherwise flood the log on a busy workspace.
+function debug(msg: string) {
+	if (DEBUG) log(`DEBUG ${msg}`);
+}
+
 // Channel-notification `meta` MUST be Record<string,string>. Claude Code validates
 // it with Zod and throws an "expected string, received <type>" error INSIDE its
 // notification handler on any non-string value — silently dropping the event before
@@ -90,7 +106,13 @@ function logError(msg: string) {
 function coerceMeta(meta: Record<string, unknown>): Record<string, string> {
 	const out: Record<string, string> = {};
 	for (const [k, v] of Object.entries(meta)) {
-		if (v === undefined || v === null) continue;
+		if (v === undefined || v === null) {
+			// A dropped key usually means an upstream lookup failed (e.g.
+			// getUserName/getChannelName returned undefined). Coercion keeps the
+			// event deliverable, but the missing field is worth a breadcrumb.
+			debug(`coerceMeta dropped null/undefined meta key: ${k}`);
+			continue;
+		}
 		out[k] = typeof v === "string" ? v : typeof v === "object" ? JSON.stringify(v) : String(v);
 	}
 	return out;
@@ -399,12 +421,25 @@ slackApp.message(async ({ message }) => {
 	// Bolt's `message` event is a union over many subtypes; we only route
 	// plain user messages. The `subtype === undefined` discriminator narrows
 	// to GenericMessageEvent, which carries channel/user/ts/thread_ts cleanly.
-	if (message.subtype !== undefined) return;
+	// Slack `message` events with a subtype are edits, joins, file_share,
+	// thread_broadcast, bot_message, etc. We only route plain user messages.
+	// These drops are silent by design but high-volume — trace under DEBUG.
+	if (message.subtype !== undefined) {
+		debug(`inbound message dropped (subtype=${message.subtype}) in ${(message as { channel?: string }).channel ?? "?"}`);
+		return;
+	}
 	const m = message as GenericMessageEvent;
-	if (!m.text || !m.user) return;
+	if (!m.text || !m.user) {
+		// e.g. blocks-only message with no top-level text.
+		debug(`inbound message dropped (no text/user) in ${m.channel}`);
+		return;
+	}
 
 	const myId = await getBotUserId();
-	if (m.user === myId) return;
+	if (m.user === myId) {
+		debug(`inbound message dropped (bot self-post) in ${m.channel}`);
+		return;
+	}
 
 	const channelId = m.channel;
 	const threadTs = m.thread_ts;
@@ -419,7 +454,14 @@ slackApp.message(async ({ message }) => {
 			matches.push({ session, kind: "channel_message" });
 		}
 	}
-	if (matches.length === 0) return;
+	if (matches.length === 0) {
+		// Arrived but matched no subscription. The single most useful diagnostic
+		// when "I'm not getting notifications": this line present = Slack DID
+		// deliver, so the gap is a missing/expired sub, not the inbound socket.
+		// channelId (not name) to avoid a Web API call on every ignored message.
+		debug(`inbound ${isReply ? "reply" : "message"} in ${channelId}${threadTs ? "/" + threadTs : ""} → 0 sessions (no matching sub)`);
+		return;
+	}
 
 	const [userName, channelName] = await Promise.all([
 		getUserName(m.user),
@@ -476,9 +518,15 @@ async function routeReactionEvent(
 	event: ReactionAddedEvent | ReactionRemovedEvent,
 	kind: "reaction" | "reaction_removed",
 ): Promise<void> {
-	if (event.item.type !== "message") return;
+	if (event.item.type !== "message") {
+		debug(`${kind} dropped (item.type=${event.item.type}, not a message)`);
+		return;
+	}
 	const myId = await getBotUserId();
-	if (event.user === myId) return;
+	if (event.user === myId) {
+		debug(`${kind} :${event.reaction}: dropped (bot self-reaction)`);
+		return;
+	}
 
 	const channelId = event.item.channel;
 	const itemTs = event.item.ts;
@@ -490,7 +538,13 @@ async function routeReactionEvent(
 			matches.push(session);
 		}
 	}
-	if (matches.length === 0) return;
+	if (matches.length === 0) {
+		// Arrived but matched no sub. Note: a reaction on a *reply inside* a
+		// subscribed thread lands here too — routing keys on the item's own ts,
+		// not the thread parent (documented limitation above).
+		debug(`${kind} :${event.reaction}: on ${channelId}/${itemTs} → 0 sessions (no matching sub)`);
+		return;
+	}
 
 	const [userName, channelName] = await Promise.all([
 		getUserName(event.user),

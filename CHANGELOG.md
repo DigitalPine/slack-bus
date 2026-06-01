@@ -2,6 +2,33 @@
 
 All notable changes to slack-bus. Dates are when the version landed on `main`.
 
+## 0.6.7 — 2026-06-01 — Inbound log breadcrumbs (SLACK_BUS_DEBUG)
+
+Inbound delivery had no log trail: when an event matched no subscription the
+handler returned silently, so "I'm not getting notifications" was undiagnosable
+from the log — you couldn't tell *never-arrived* (Socket Mode / scope problem)
+from *arrived-but-no-matching-sub* from *matched-but-client-push-stream-dead*
+(the silent `dispatched OK` lie, [DIG-279](https://linear.app/digital-pine/issue/DIG-279)).
+([DIG-280](https://linear.app/digital-pine/issue/DIG-280))
+
+- **`SLACK_BUS_DEBUG` env flag** (default off) + a `debug()` logger (prefixed
+  `DEBUG ` for one-grep include/exclude). Gated because `slackApp.message`
+  fires for every message in every channel the bot is in — always-on tracing
+  would flood the log on a busy workspace.
+- **Every inbound drop now leaves a breadcrumb under DEBUG**: subtype drops
+  (edits, `file_share`, `thread_broadcast`, bot messages), empty-text/blocks-only
+  messages, bot self-events, reactions on non-message items, and — the key one —
+  `→ 0 sessions (no matching sub)` for both messages and reactions. That line's
+  presence proves Slack delivered the event, isolating the failure to a
+  missing/expired sub rather than the inbound socket.
+- **`coerceMeta` logs dropped keys** under DEBUG — a null/undefined meta value
+  usually means an upstream `getUserName`/`getChannelName` lookup failed.
+- **No behavior change with the flag off** — all new lines are debug-gated;
+  the live path is byte-for-byte identical until you opt in.
+- Diagnosis flow: flip `SLACK_BUS_DEBUG=1`, restart, reproduce, read the log.
+  (A future always-on alternative: a recent-inbound ring buffer in `bus_status`,
+  noted on DIG-280.)
+
 ## 0.6.6 — 2026-05-28 — Rendered timestamps at every agent boundary
 
 Agents were handed raw Unix epoch timestamps (`"ts": "1779897289.590119"`)
