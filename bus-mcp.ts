@@ -46,7 +46,7 @@ import {
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
-const VERSION = "0.6.7";
+const VERSION = "0.7.0";
 
 const INSTANCE = process.env.SLACK_BUS_INSTANCE;
 if (!INSTANCE) {
@@ -604,6 +604,43 @@ type Tool = {
 	inputSchema: Record<string, unknown>;
 	handler: (session: Session, args: Record<string, any>) => Promise<string>;
 };
+
+// Slack's canvas methods take JSON bodies with nested document_content / changes
+// arrays — the typed WebClient form-encodes args, which mangles that shape. We
+// call them directly (Bearer + JSON, matching Slack's spec) and reshape any
+// failure into a WebAPICallError-like error ({ data: { error } }) so the shared
+// classifyError() buckets it — notably the free-tier canvas restriction, which
+// we want surfaced as an actionable "use a channel canvas instead" message
+// rather than an opaque code.
+async function canvasApi(
+	method: string,
+	body: Record<string, unknown>,
+): Promise<any> {
+	const res = await fetch(`https://slack.com/api/${method}`, {
+		method: "POST",
+		headers: {
+			Authorization: `Bearer ${SLACK_BOT_TOKEN}`,
+			"Content-Type": "application/json; charset=utf-8",
+		},
+		body: JSON.stringify(body),
+	});
+	const json = (await res.json()) as {
+		ok: boolean;
+		error?: string;
+		detail?: string;
+		[k: string]: unknown;
+	};
+	if (!json.ok) {
+		const detail = json.detail ? ` (${json.detail})` : "";
+		const err = new Error(
+			`Slack ${method} failed: ${json.error ?? "unknown_error"}${detail}`,
+		) as Error & { data?: { error?: string } };
+		// Shape like @slack/web-api's WebAPICallError so classifyError sees the code.
+		err.data = { error: json.error };
+		throw err;
+	}
+	return json;
+}
 
 const TOOLS: Tool[] = [
 	// ─── Messaging ────────────────────────────────────────────────────────────
@@ -1232,6 +1269,198 @@ const TOOLS: Tool[] = [
 				thread_ts: args.thread_ts,
 			});
 			return `Text uploaded as ${args.filename} (${contentLength} bytes)`;
+		},
+	},
+
+	// ─── Canvases ─────────────────────────────────────────────────────────────
+	// A canvas is a Slack-native rich document. Content is Slack-flavored
+	// markdown (NOT Block Kit, NOT mrkdwn): # ## ### headings, **bold**, _italic_,
+	// ~~strike~~, `code`, ```fences```, - bullets, 1. ordered, - [ ] / - [x]
+	// checkboxes (done items render struck-through), > quotes, --- dividers,
+	// [text](url) links, ![alt](url) images, and | tables | (max 300 cells).
+	// Images render INLINE only if Slack can fetch the URL publicly — for
+	// private/local images, upload_file first and embed the returned permalink.
+	// No cover images via API (UI-only). On a FREE workspace, standalone
+	// (non-tabbed) canvases can't be created — attach to a channel instead.
+	{
+		name: "create_canvas",
+		description:
+			"Create a Slack canvas — a rich Slack-native document (headings, checklists, tables, quotes, inline images, links). Body is Slack-flavored markdown (see `markdown`).\n\n" +
+			"• WITHOUT `channel_id`: a standalone canvas (lives in Files, shareable by URL). PAID workspaces only — on a free workspace this fails with `free_teams_cannot_create_non_tabbed_canvases`; pass `channel_id` or use create_channel_canvas instead.\n" +
+			"• WITH `channel_id`: also attaches the canvas as a tab on that channel (bot must be a member). Works on free workspaces.\n\n" +
+			"Returns canvas_id. Mutate later with edit_canvas; get section ids for targeted edits with lookup_canvas_sections.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				markdown: {
+					type: "string",
+					description:
+						"Canvas body, Slack-flavored markdown. Supported: # ## ### headings, **bold**, _italic_, ~~strike~~, `code`, fenced code, - bullets, 1. ordered lists, - [ ] / - [x] checkboxes (done → struck-through), > quote blocks, --- dividers, [text](url) links, ![alt](url) images (inline ONLY if Slack can publicly fetch the URL — else upload_file and embed the permalink), and | markdown tables | (max 300 cells total). NOT supported: Block Kit, cover images (UI-only), deeply nested lists.",
+				},
+				title: {
+					type: "string",
+					description: "Canvas title shown at the top and in the file list.",
+				},
+				channel_id: {
+					type: "string",
+					description:
+						"Optional. Attach the canvas as a tab on this channel (bot must be a member). REQUIRED on free workspaces — a standalone canvas (no channel_id) is paid-only.",
+				},
+			},
+			required: ["markdown"],
+		},
+		handler: async (_session, args) => {
+			const body: Record<string, unknown> = {
+				document_content: { type: "markdown", markdown: args.markdown },
+			};
+			if (args.title) body.title = args.title;
+			if (args.channel_id) body.channel_id = args.channel_id;
+			const res = await canvasApi("canvases.create", body);
+			const where = args.channel_id
+				? ` as a tab on ${args.channel_id}`
+				: " (standalone)";
+			return `Canvas created${where}. canvas_id=${res.canvas_id}\nEdit with edit_canvas; list section ids with lookup_canvas_sections.`;
+		},
+	},
+	{
+		name: "create_channel_canvas",
+		description:
+			"Create/set the canvas built into a channel (its Canvas tab) via conversations.canvases.create. Distinct from create_canvas with a channel_id: this is THE channel's own canvas — access follows channel membership (no separate sharing), one per channel. Works on free workspaces. Bot must be a member of the channel. Same Slack-flavored markdown dialect as create_canvas. Returns canvas_id.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				channel_id: {
+					type: "string",
+					description: "Channel ID whose canvas to create/set. Bot must be a member.",
+				},
+				markdown: {
+					type: "string",
+					description:
+						"Canvas body, Slack-flavored markdown (same dialect as create_canvas).",
+				},
+			},
+			required: ["channel_id", "markdown"],
+		},
+		handler: async (_session, args) => {
+			const res = await canvasApi("conversations.canvases.create", {
+				channel_id: args.channel_id,
+				document_content: { type: "markdown", markdown: args.markdown },
+			});
+			return `Channel canvas created for ${args.channel_id}. canvas_id=${res.canvas_id}`;
+		},
+	},
+	{
+		name: "lookup_canvas_sections",
+		description:
+			"List section ids in a canvas, needed to target edit_canvas operations (insert_before/after, replace, delete). IMPORTANT: section ids are EPHEMERAL — every edit can change them, so call this immediately before each targeted edit and never reuse an id across edits. Optionally filter by heading level with `section_types`.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				canvas_id: { type: "string", description: "Canvas ID (e.g. F0B7NQZ9MKP)." },
+				section_types: {
+					type: "array",
+					items: { type: "string" },
+					description:
+						"Optional filter, e.g. [\"h1\",\"h2\",\"h3\"]. Omit to return all sections.",
+				},
+			},
+			required: ["canvas_id"],
+		},
+		handler: async (_session, args) => {
+			const body: Record<string, unknown> = { canvas_id: args.canvas_id };
+			if (Array.isArray(args.section_types) && args.section_types.length > 0) {
+				body.criteria = { section_types: args.section_types };
+			}
+			const res = await canvasApi("canvases.sections.lookup", body);
+			const sections = (res.sections ?? []) as Array<{ id: string }>;
+			if (sections.length === 0) {
+				return `No sections found in ${args.canvas_id}.`;
+			}
+			return `${sections.length} section(s) in ${args.canvas_id} (ids are ephemeral — use immediately):\n${sections.map((s) => `  ${s.id}`).join("\n")}`;
+		},
+	},
+	{
+		name: "edit_canvas",
+		description:
+			"Edit an existing canvas. Default appends to the end. For targeted edits (insert near / replace / delete a specific section), FIRST call lookup_canvas_sections to get a fresh section_id (they change after every edit). To rename the canvas, use operation=rename with `title`.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				canvas_id: { type: "string", description: "Canvas ID." },
+				operation: {
+					type: "string",
+					enum: [
+						"insert_at_end",
+						"insert_at_start",
+						"insert_after",
+						"insert_before",
+						"replace",
+						"delete",
+						"rename",
+					],
+					description:
+						"Default insert_at_end. insert_after/insert_before/delete require section_id; replace takes an optional section_id (omit to replace the whole canvas); rename uses `title`.",
+				},
+				markdown: {
+					type: "string",
+					description:
+						"Slack-flavored markdown to insert/replace. Required for every operation except delete and rename.",
+				},
+				section_id: {
+					type: "string",
+					description:
+						"Target section, from a FRESH lookup_canvas_sections call. Required for insert_after, insert_before, delete; optional for replace.",
+				},
+				title: {
+					type: "string",
+					description: "New canvas title — only for operation=rename.",
+				},
+			},
+			required: ["canvas_id"],
+		},
+		handler: async (_session, args) => {
+			const op: string = args.operation || "insert_at_end";
+			const change: Record<string, unknown> = { operation: op };
+			if (op === "rename") {
+				if (!args.title) throw new Error("operation=rename requires `title`.");
+				change.title_content = { type: "markdown", markdown: args.title };
+			} else if (op === "delete") {
+				if (!args.section_id)
+					throw new Error("operation=delete requires `section_id`.");
+				change.section_id = args.section_id;
+			} else {
+				if (!args.markdown)
+					throw new Error(`operation=${op} requires \`markdown\`.`);
+				change.document_content = { type: "markdown", markdown: args.markdown };
+				if (op === "insert_after" || op === "insert_before") {
+					if (!args.section_id)
+						throw new Error(`operation=${op} requires \`section_id\`.`);
+					change.section_id = args.section_id;
+				} else if (op === "replace" && args.section_id) {
+					change.section_id = args.section_id;
+				}
+			}
+			await canvasApi("canvases.edit", {
+				canvas_id: args.canvas_id,
+				changes: [change],
+			});
+			return `Canvas ${args.canvas_id} edited (${op}).`;
+		},
+	},
+	{
+		name: "delete_canvas",
+		description:
+			"Delete an entire canvas by id. To remove just a section, use edit_canvas with operation=delete instead.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				canvas_id: { type: "string", description: "Canvas ID to delete." },
+			},
+			required: ["canvas_id"],
+		},
+		handler: async (_session, args) => {
+			await canvasApi("canvases.delete", { canvas_id: args.canvas_id });
+			return `Canvas ${args.canvas_id} deleted.`;
 		},
 	},
 

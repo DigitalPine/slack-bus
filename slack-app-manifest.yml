@@ -51,6 +51,10 @@ oauth_config:
       - files:write
       - files:read
 
+      # Canvas operations (create_canvas, create_channel_canvas, edit_canvas, read_canvas)
+      - canvases:write
+      - canvases:read
+
       # ─── Optional: uncomment for the rest of the tool surface ──────────
       # - channels:join       # join_channel tool
       # - channels:manage     # create_channel, invite_users tools

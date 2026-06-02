@@ -2,6 +2,39 @@
 
 All notable changes to slack-bus. Dates are when the version landed on `main`.
 
+## 0.7.0 — 2026-06-02 — Canvas tools
+
+Slack canvases — rich Slack-native documents — are now first-class. Five tools
+wrap the canvas API, with descriptions and error handling shaped around the
+real edge cases (verified empirically against both a free and a paid workspace
+before shipping, not guessed from docs).
+
+- **`create_canvas`** — standalone canvas (paid only) or, with `channel_id`, a
+  canvas attached as a channel tab (works on free). **`create_channel_canvas`**
+  — the channel's own built-in canvas (`conversations.canvases.create`, works on
+  free). **`edit_canvas`** — append / insert-near / replace / delete-section /
+  rename. **`lookup_canvas_sections`** — fetch section ids for targeted edits.
+  **`delete_canvas`**.
+- **Content is Slack-flavored markdown** (NOT Block Kit, NOT mrkdwn): headings,
+  **bold**/_italic_/~~strike~~, code, checkboxes (done → struck-through), quotes,
+  dividers, links, tables (≤300 cells), and `![alt](url)` images that render
+  inline **only if Slack can publicly fetch the URL** — otherwise upload_file and
+  embed the permalink. Cover images are UI-only (no API).
+- **Free-tier DX, surfaced not buried.** A standalone-canvas attempt on a free
+  workspace returns `free_teams_cannot_create_non_tabbed_canvases`; classifyError
+  now buckets this as a new **`plan`** category with an actionable message ("free
+  tier — pass channel_id or use create_channel_canvas") so the calling agent
+  understands it hit a plan ceiling, not a request bug. A broader paid-only error
+  family is matched defensively.
+- **Gotcha baked into the tool docs:** canvas section ids are *ephemeral* — they
+  change after every edit. `lookup_canvas_sections` and `edit_canvas` both tell
+  the agent to re-look-up immediately before each targeted edit, never reuse.
+- Direct JSON API calls (not the form-encoding WebClient) so nested
+  `document_content` / `changes` arrays match Slack's spec; failures are reshaped
+  into `WebAPICallError`-like errors so the shared classifier still applies.
+- Manifest adds `canvases:write` + `canvases:read`; the live DP app was
+  reinstalled to grant them.
+
 ## 0.6.7 — 2026-06-01 — Inbound log breadcrumbs (SLACK_BUS_DEBUG)
 
 Inbound delivery had no log trail: when an event matched no subscription the

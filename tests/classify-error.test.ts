@@ -84,6 +84,37 @@ describe("classifyError", () => {
 		expect(r.category).toBe("unreachable");
 	});
 
+	// canvasApi() throws errors carrying { data: { error } } but no `code` —
+	// classifyError reads the slack error off data.error regardless.
+	function canvasError(slackError: string) {
+		return Object.assign(new Error(`Slack canvases.create failed: ${slackError}`), {
+			data: { error: slackError },
+		});
+	}
+
+	it("flags the free-tier canvas restriction as a non-retryable plan limit with a workaround", () => {
+		const r = classifyError(canvasError("free_teams_cannot_create_non_tabbed_canvases"));
+		expect(r.category).toBe("plan");
+		expect(r.message).toMatch(/free/i);
+		expect(r.message).toMatch(/channel_id|create_channel_canvas/);
+		expect(r.message).toMatch(/retry/i);
+	});
+
+	it("catches the narrow paid-only plan family defensively", () => {
+		for (const code of ["paid_teams_only", "team_not_on_paid_plan", "feature_not_allowed_on_free"]) {
+			const r = classifyError(canvasError(code));
+			expect(r.category).toBe("plan");
+			expect(r.message).toContain(code);
+		}
+	});
+
+	it("treats an existing-channel-canvas as a recoverable api error, not a tier ceiling", () => {
+		const r = classifyError(canvasError("free_team_canvas_tab_already_exists"));
+		expect(r.category).toBe("api");
+		expect(r.message).toMatch(/edit_canvas/);
+		expect(r.message).toMatch(/already has a canvas/i);
+	});
+
 	it("falls back to unknown for plain handler validation throws", () => {
 		const r = classifyError(new Error("post_message requires either `blocks` or `text`."));
 		expect(r.category).toBe("unknown");
