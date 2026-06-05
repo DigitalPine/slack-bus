@@ -46,7 +46,7 @@ import {
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
-const VERSION = "0.7.0";
+const VERSION = "0.7.1";
 
 const INSTANCE = process.env.SLACK_BUS_INSTANCE;
 if (!INSTANCE) {
@@ -393,6 +393,58 @@ type Session = {
 };
 
 const sessions = new Map<string, Session>();
+
+// ─── Subscription retention for GET-stream re-adoption (DIG-279) ───────────────
+// When a session is dropped (idle-reaped, or a clean DELETE) its subscription set
+// is preserved here, keyed by sid, for a bounded window — so that if the same
+// client reconnects carrying the old sid (a GET event-stream re-adoption; see the
+// fetch handler), we can rehydrate its subscriptions onto the re-adopted session.
+//
+// Why this is slack-bus-specific: channels-lab proved (FINDINGS.md, real
+// claude-code@2.1.165, n=2, 200-vs-404 causal) that answering the unknown-sid GET
+// reconnect with 200 + a fresh live stream restores RENDER. But slack-bus event
+// routing is *subscription-gated* — a re-adopted session with empty subs renders a
+// live pipe yet routes ZERO Slack events. So re-adoption MUST also restore subs.
+// (runtime-bus/probe-bus aren't sub-gated, so their probe never surfaced this.)
+//
+// NOTE: this map is in-memory, so it survives the forget-without-restart window
+// (reaper / DELETE) but NOT a daemon process restart. Cross-restart rehydration
+// needs disk persistence — gated on confirming restart-parity (does a real client
+// reconnect with its old sid after an actual process restart?). See DIG-279.
+type RetainedSubs = {
+	threads: Map<string, number | null>;
+	channels: Map<string, number | null>;
+	retainedAt: number;
+};
+const retainedSubs = new Map<string, RetainedSubs>();
+// Retained subs older than this are swept — a re-adoption reconnect lands ~1s
+// after the drop, so an hour is generous insurance, not a tuned value.
+const RETAINED_SUBS_TTL_MS = (() => {
+	const fromEnv = Number(process.env.SLACK_BUS_RETAINED_SUBS_TTL_SECONDS);
+	if (Number.isFinite(fromEnv) && fromEnv > 0) return Math.floor(fromEnv * 1000);
+	return 60 * 60 * 1000;
+})();
+
+// Preserve a dropped session's subs for possible re-adoption. No-op when the
+// session held no subscriptions (nothing to rehydrate — re-adoption would build a
+// fresh empty session anyway).
+function retainSubs(s: Session): void {
+	if (s.threads.size === 0 && s.channels.size === 0) return;
+	retainedSubs.set(s.id, {
+		threads: new Map(s.threads),
+		channels: new Map(s.channels),
+		retainedAt: Date.now(),
+	});
+}
+
+// Reclaim (and remove) retained subs for a re-adopted sid, if still within TTL.
+function takeRetainedSubs(sid: string): RetainedSubs | undefined {
+	const r = retainedSubs.get(sid);
+	if (!r) return undefined;
+	retainedSubs.delete(sid);
+	if (Date.now() - r.retainedAt > RETAINED_SUBS_TTL_MS) return undefined;
+	return r;
+}
 
 // Pure lifecycle helpers (TTL expiry + idle reaping) live in lifecycle.ts so
 // they're unit-testable without booting the daemon. See tests/lifecycle.test.ts.
@@ -1734,12 +1786,18 @@ const TOOLS: Tool[] = [
 
 // ─── Per-session MCP server factory ───────────────────────────────────────────
 
-function buildSessionServer(): {
+// Build a fresh transport+server pair for a session. With no argument this is a
+// brand-new session (sid minted on `initialize`). With `adoptId`, it RE-ADOPTS an
+// existing sid arriving on a GET reconnect the bus no longer knows about — see the
+// adoption block at the end of this function and the fetch handler's re-adopt fork.
+function buildSessionServer(adoptId?: string): {
 	transport: WebStandardStreamableHTTPServerTransport;
 	server: Server;
 	getSessionId: () => string;
 } {
-	let assignedId = "";
+	// Seed with adoptId so the tool-call handler (sessions.get(assignedId)) routes
+	// correctly on a re-adopted session, where onsessioninitialized never fires.
+	let assignedId = adoptId ?? "";
 	const transport = new WebStandardStreamableHTTPServerTransport({
 		sessionIdGenerator: () => randomUUID(),
 		onsessioninitialized: (sid) => {
@@ -1759,8 +1817,12 @@ function buildSessionServer(): {
 			const s = sessions.get(sid);
 			if (s) {
 				log(
-					`session closed: ${sid}, dropping ${s.threads.size} thread + ${s.channels.size} channel sub(s)`,
+					`session closed: ${sid}, retaining ${s.threads.size} thread + ${s.channels.size} channel sub(s) for re-adoption`,
 				);
+				// Preserve subs before dropping — Claude Code doesn't send DELETE
+				// today, but if a clean close ever fires we still want a reconnect
+				// to be able to rehydrate. (Idle-reaper path retains too.)
+				retainSubs(s);
 				sessions.delete(sid);
 			}
 		},
@@ -1820,6 +1882,33 @@ function buildSessionServer(): {
 
 	void server.connect(transport);
 
+	// ─── Re-adoption ──────────────────────────────────────────────────────────
+	// No real `initialize` fires for an adopted transport, so onsessioninitialized
+	// never runs and the SDK's validateSession would 404 a GET carrying this sid.
+	// Coerce the transport into the post-init state the SDK demands (sessionId match
+	// + _initialized), then register + rehydrate the session ourselves. Mechanism
+	// measured in channels-lab (FINDINGS.md): answering the unknown-sid GET with
+	// 200 + this coerced live stream restores render+routing on a real client; the
+	// 200-vs-404 difference is causal. The private-field pokes are pinned to the
+	// vendored SDK version — guarded here and re-verify on SDK bumps.
+	if (adoptId) {
+		transport.sessionId = adoptId;
+		(transport as unknown as { _initialized: boolean })._initialized = true;
+		const restored = takeRetainedSubs(adoptId);
+		const session: Session = {
+			id: adoptId,
+			server,
+			transport,
+			threads: restored?.threads ?? new Map(),
+			channels: restored?.channels ?? new Map(),
+			lastSeen: Date.now(),
+		};
+		sessions.set(adoptId, session);
+		log(
+			`session RE-ADOPTED: ${adoptId} (coerced _initialized; rehydrated ${session.threads.size} thread + ${session.channels.size} channel sub(s)${restored ? "" : " — none retained"})`,
+		);
+	}
+
 	return {
 		transport,
 		server,
@@ -1838,6 +1927,59 @@ Bun.serve({
 	idleTimeout: 0,
 	async fetch(req) {
 		const url = new URL(req.url);
+
+		// Test-only debug levers (DIG-279 re-adopt validation), gated behind
+		// SLACK_BUS_DEBUG_LEVERS — inert in production. Lets a real claude-code
+		// receiver be driven (forget / push render-proof / inspect) without Slack.
+		if (process.env.SLACK_BUS_DEBUG_LEVERS === "1" && url.pathname.startsWith("/debug/")) {
+			if (url.pathname === "/debug/sessions") {
+				return Response.json({
+					openSessions: sessions.size,
+					sessions: [...sessions.values()].map((s) => ({
+						id: s.id,
+						threads: [...s.threads.keys()],
+						channels: [...s.channels.keys()],
+						idleSec: Math.round((Date.now() - s.lastSeen) / 1000),
+					})),
+					retained: [...retainedSubs.entries()].map(([sid, r]) => ({
+						id: sid,
+						threads: [...r.threads.keys()],
+						channels: [...r.channels.keys()],
+					})),
+				});
+			}
+			if (url.pathname.startsWith("/debug/forget/")) {
+				// Drop a session + close its SSE stream WITHOUT restarting the daemon
+				// (isolates "bus forgot you" from "process died"). Retains subs first
+				// so a reconnect can rehydrate — the path under test.
+				const sid = decodeURIComponent(url.pathname.slice("/debug/forget/".length));
+				const s = sessions.get(sid);
+				if (!s) return new Response("unknown sid", { status: 404 });
+				retainSubs(s);
+				(s.transport as unknown as { closeStandaloneSSEStream?: () => void }).closeStandaloneSSEStream?.();
+				sessions.delete(sid);
+				log(`[debug] FORGOT ${sid} (closed stream + dropped; daemon stays up)`);
+				return Response.json({ ok: true, forgot: sid });
+			}
+			if (url.pathname.startsWith("/debug/push/")) {
+				// Fire one channel notification at a session (render proof without Slack).
+				const sid = decodeURIComponent(url.pathname.slice("/debug/push/".length));
+				const s = sessions.get(sid);
+				if (!s) return new Response("unknown sid", { status: 404 });
+				const marker = url.searchParams.get("m") ?? "x";
+				await s.server.notification({
+					method: "notifications/claude/channel",
+					params: {
+						content: `slack-bus re-adopt probe [marker ${marker}] — to confirm you RENDERED this, call the bus_status tool now.`,
+						meta: { source: "slack-bus-test", kind: "selftest", marker },
+					},
+				});
+				log(`[debug] pushed marker=${marker} → ${sid} (send resolved; render unproven until a tool call returns on this sid)`);
+				return Response.json({ ok: true, marker, sid });
+			}
+			return new Response("unknown debug lever", { status: 404 });
+		}
+
 		if (url.pathname !== "/mcp") {
 			return new Response("not found", { status: 404 });
 		}
@@ -1852,6 +1994,40 @@ Bun.serve({
 			s.lastSeen = Date.now();
 			log(`req method=${req.method} session=${sessionId.slice(0, 8)}…`);
 			return s.transport.handleRequest(req);
+		}
+
+		// Unknown-but-present sid on a GET event-stream = a reconnect the bus no
+		// longer knows about. The live client kept its sid and is reopening its SSE
+		// push pipe after the bus forgot it (idle-reaped, a clean close, or — the
+		// case that matters most for slack-bus — a daemon restart/kickstart). The
+		// SDK would 404 this, which a real claude-code client treats as fatal: it
+		// retries the GET twice (~1.5s) then abandons the push stream for good. POST
+		// keeps working, so the session looks healthy while silently rendering
+		// nothing — the DIG-279 zombie. Re-adopt instead: answer 200 with a fresh
+		// live stream coerced onto the same sid (and rehydrate its subs). channels-lab
+		// measured this recovers render+routing on a real client; 200-vs-404 is causal.
+		const accept = req.headers.get("accept") ?? "";
+		const isStream = accept.includes("text/event-stream");
+		if (sessionId && isStream && req.method === "GET") {
+			log(`re-adopt: unknown sid ${sessionId.slice(0, 8)}… on GET stream → 200 + fresh live stream`);
+			const { transport } = buildSessionServer(sessionId);
+			const resp = await transport.handleRequest(req);
+			// Priming flush: enqueue an ignored SSE comment so 200 status+headers
+			// reach the client immediately. channels-lab measured this is NOT required
+			// on Bun.serve (Bun flushes headers when the streaming Response returns)
+			// but IS load-bearing on runtimes that withhold headers until first byte.
+			// Kept as harmless insurance so a future move off Bun stays safe.
+			try {
+				const t = transport as unknown as {
+					_streamMapping?: Map<string, { controller?: { enqueue: (b: Uint8Array) => void }; encoder: TextEncoder }>;
+					_standaloneSseStreamId?: string;
+				};
+				const entry = t._streamMapping?.get(t._standaloneSseStreamId ?? "");
+				entry?.controller?.enqueue(entry.encoder.encode(": slack-bus-readopt-priming\n\n"));
+			} catch (e) {
+				log(`re-adopt priming flush failed for ${sessionId.slice(0, 8)}…: ${e instanceof Error ? e.message : String(e)}`);
+			}
+			return resp;
 		}
 
 		// New session: only valid on POST (initialize). Build a transport+server pair.
@@ -1885,8 +2061,11 @@ setInterval(() => {
 		if (isIdleExpired(session.lastSeen, IDLE_REAP_MS, now)) {
 			const idleStr = formatIdle(now - session.lastSeen);
 			log(
-				`session reaped (idle ${idleStr}): ${session.id}, dropping ${session.threads.size} thread + ${session.channels.size} channel sub(s)`,
+				`session reaped (idle ${idleStr}): ${session.id}, retaining ${session.threads.size} thread + ${session.channels.size} channel sub(s) for re-adoption`,
 			);
+			// Retain subs so a still-running client that reconnects with this sid can
+			// rehydrate (see retainedSubs / the fetch handler re-adopt fork, DIG-279).
+			retainSubs(session);
 			sessions.delete(session.id);
 			// Best-effort: tell the transport to close. The underlying SSE
 			// stream is usually already dead at this point, so both sync
@@ -1898,6 +2077,16 @@ setInterval(() => {
 			} catch {
 				// intentional no-op — close() threw synchronously
 			}
+		}
+	}
+
+	// Sweep retained subs that were never reclaimed by a reconnect (the client is
+	// really gone). takeRetainedSubs() also TTL-guards on reclaim; this bounds the
+	// map for sids that simply never come back.
+	for (const [sid, r] of Array.from(retainedSubs.entries())) {
+		if (now - r.retainedAt > RETAINED_SUBS_TTL_MS) {
+			retainedSubs.delete(sid);
+			log(`retained subs expired (never reconnected): ${sid}`);
 		}
 	}
 }, REAPER_INTERVAL_MS);
@@ -1915,9 +2104,16 @@ log(
 	`config — idle_reap=${IDLE_REAP_MS / 1000}s reaper_interval=${REAPER_INTERVAL_MS / 1000}s log=${LOG_FILE}`,
 );
 
-await slackApp.start();
-const myId = await getBotUserId();
-log(`Slack Socket Mode connected. bot_user_id=${myId}`);
+// Test harness only (DIG-279 re-adopt validation): boot HTTP-transport-only with
+// no Socket Mode, so a test instance on a spare port never contends for the
+// exclusive per-app-token Slack socket held by the live daemon. Inert in prod.
+if (process.env.SLACK_BUS_NO_SLACK === "1") {
+	log("SLACK_BUS_NO_SLACK=1 — skipping Socket Mode (HTTP transport only; test harness)");
+} else {
+	await slackApp.start();
+	const myId = await getBotUserId();
+	log(`Slack Socket Mode connected. bot_user_id=${myId}`);
+}
 log(`listening on http://localhost:${PORT}/mcp`);
 log(`slack-bus v${VERSION} ready`);
 

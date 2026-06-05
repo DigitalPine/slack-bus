@@ -2,6 +2,32 @@
 
 All notable changes to slack-bus. Dates are when the version landed on `main`.
 
+## 0.7.1 — 2026-06-05 — Channel re-adoption (DIG-279)
+
+When the client's MCP push pipe (the GET SSE stream) is severed but the daemon
+stays up — an idle-reaped-but-still-live session, a network blip, a graceful
+stream close — the client reconnects ~1s later carrying its *old* `mcp-session-id`.
+The SDK 404s that unknown sid, which the client treats as fatal: it abandons the
+push stream while POST keeps working, so the session looks healthy but silently
+renders nothing (the DIG-279 zombie).
+
+- **Re-adoption.** The HTTP handler now forks on the unknown-sid GET event-stream
+  reconnect and answers **200 + a fresh live stream coerced onto the same sid**
+  (`buildSessionServer(adoptId)`: `sessionId` + `_initialized` coercion), instead
+  of falling through to the 400 that strands the client. A priming-flush SSE
+  comment is included as harmless insurance (not load-bearing on Bun.serve).
+- **Subscription rehydration.** Because slack-bus routing is subscription-gated, a
+  re-adopted session with empty subs would render a live pipe but route zero Slack
+  events. Dropped sessions now retain their subscription set (`retainedSubs`, TTL-
+  swept); re-adoption rehydrates it.
+- **Validated** against a real `claude-code@2.1.165` receiver on an isolated rig:
+  forget-but-stay-up → transparent recovery + render (n=2). **Measured limit:** a
+  *true process restart* (kickstart) RSTs both pipes and the client **ends the
+  session** rather than reconnecting — so re-adoption covers the stream-severed
+  case, not restarts. Restart the daemon only when sessions can be relaunched.
+- Test harness (gated, inert in prod): `SLACK_BUS_NO_SLACK` boots HTTP-only;
+  `SLACK_BUS_DEBUG_LEVERS` enables `/debug/{sessions,forget,push}`.
+
 ## 0.7.0 — 2026-06-02 — Canvas tools
 
 Slack canvases — rich Slack-native documents — are now first-class. Five tools
