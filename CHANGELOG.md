@@ -2,6 +2,38 @@
 
 All notable changes to slack-bus. Dates are when the version landed on `main`.
 
+## 0.8.0 — 2026-07-30 — Entity resolution (agent-DX)
+
+Slack delivers message text with machine-encoded entity tokens (`<@U0123>`,
+`<#C0456>`, `<!here>`, `<https://x|label>`). Live probes against real channels
+confirmed both user and channel mentions arrive **bare** in practice (no
+inline `|name` fallback), forcing the agent to either guess identity inline or
+issue a follow-up lookup — most of the time it just won't, and answers degrade
+into "someone in some channel reacted to something."
+
+- **New pure module `resolve-entities.ts`** — `extractEntityIds(text)` plus
+  `applyEntityResolution(text, maps)` with unit-test coverage (25 cases) of
+  every token shape: bare/fallback user, bare/fallback channel, `<!here>` /
+  `<!channel>` / `<!everyone>`, `<!subteam^…>`, `<!date^…>`, labeled and bare
+  URLs, mailto, unknown tokens, HTML-entity unescape. Lookup misses fall back
+  to the bare id rendered as `@U0123` / `#C0456` — never throws.
+- **Wired at three boundaries** in `bus-mcp.ts`:
+  - `get_channel_context` — collects all referenced ids across the batch,
+    resolves once through the existing user/channel caches, rewrites each
+    message's `text` (preserving original on `text_raw` when changed).
+  - Inbound `message` notification — `content` arrives resolved; `meta.text_raw`
+    surfaces when a rewrite happened.
+  - Inbound `reaction` / `reaction_removed` notification — the target
+    message's author (`item_user`) is now resolved and named in the content
+    string and as `meta.item_user_name`.
+- **Reactor identity (#3 from the agent-DX audit)** — per-message reactions in
+  `get_channel_context` now include `users: [...]` with resolved display names
+  for each reactor. Agents can answer "who reacted with :tada:?" without a
+  follow-up `users.info` call.
+- `get_channel_context` tool description updated to advertise the new shape so
+  the agent reads `text` as canonical and only reaches for `text_raw` when it
+  needs the bracket-escaped form.
+
 ## 0.7.1 — 2026-06-05 — Channel re-adoption (DIG-279)
 
 When the client's MCP push pipe (the GET SSE stream) is severed but the daemon

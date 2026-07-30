@@ -43,10 +43,15 @@ import {
 	threadKey,
 	ttlToExpiresAt,
 } from "./lifecycle.ts";
+import {
+	applyEntityResolution,
+	type EntityMaps,
+	extractEntityIds,
+} from "./resolve-entities.ts";
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
-const VERSION = "0.7.1";
+const VERSION = "0.8.0";
 
 const INSTANCE = process.env.SLACK_BUS_INSTANCE;
 if (!INSTANCE) {
@@ -198,14 +203,26 @@ function compactMessage(msg: any) {
 		text: msg.text ?? "",
 		type: msg.type ?? "message",
 	};
+	// When the daemon has resolved entity tokens into human-legible text, the
+	// caller stashed the original on msg.text_raw — preserve it so the agent
+	// still has the bracket-escaped form for fidelity / re-emit if it needs to.
+	if (msg.text_raw && msg.text_raw !== out.text) out.text_raw = msg.text_raw;
 	if (msg.user) out.user = msg.user;
 	if (msg.bot_id) out.bot_id = msg.bot_id;
 	if (msg.user_name) out.user_name = msg.user_name;
 	if (msg.thread_ts) out.thread_ts = msg.thread_ts;
 	if (Array.isArray(msg.reactions)) {
+		// reactor_names (when present) is a per-reaction array of resolved display
+		// names — see the get_channel_context enrichment pass. Surface it so the
+		// agent can answer "who reacted with :tada:?" without a second lookup;
+		// when unavailable (notification paths skip the resolve), we silently
+		// fall back to just name+count.
 		out.reactions = msg.reactions.map((r: any) => ({
 			name: r.name,
 			count: r.count ?? (r.users?.length ?? 0),
+			...(Array.isArray(r.reactor_names) && r.reactor_names.length > 0
+				? { users: r.reactor_names }
+				: {}),
 		}));
 	}
 	return out;
@@ -377,6 +394,37 @@ async function getUserName(userId: string): Promise<string> {
 	}
 }
 
+// Bulk-resolve the user/channel ids extracted from one or more message bodies,
+// using the existing userCache/channelCache as the primary store. Cache hits
+// are free; cache misses run as one parallel batch. Lookup failures fall back
+// to the bare id (handled inside getUserName/getChannelName), which
+// applyEntityResolution then renders as `@U0123` / `#C0456`.
+//
+// This is the only async glue between `extractEntityIds` and
+// `applyEntityResolution`; keeping the resolution itself pure makes the
+// substitution rules unit-testable without faking the Slack web API.
+async function buildEntityMaps(texts: Array<string | undefined>): Promise<EntityMaps> {
+	const allUserIds = new Set<string>();
+	const allChannelIds = new Set<string>();
+	for (const t of texts) {
+		if (!t) continue;
+		const { userIds, channelIds } = extractEntityIds(t);
+		for (const id of userIds) allUserIds.add(id);
+		for (const id of channelIds) allChannelIds.add(id);
+	}
+	const users = new Map<string, string>();
+	const channels = new Map<string, string>();
+	await Promise.all([
+		...[...allUserIds].map(async (id) => {
+			users.set(id, await getUserName(id));
+		}),
+		...[...allChannelIds].map(async (id) => {
+			channels.set(id, await getChannelName(id));
+		}),
+	]);
+	return { users, channels };
+}
+
 // ─── Sessions & routing ───────────────────────────────────────────────────────
 
 type Session = {
@@ -515,10 +563,14 @@ slackApp.message(async ({ message }) => {
 		return;
 	}
 
-	const [userName, channelName] = await Promise.all([
+	const [userName, channelName, entityMaps] = await Promise.all([
 		getUserName(m.user),
 		getChannelName(channelId),
+		buildEntityMaps([m.text]),
 	]);
+
+	const rawText = typeof m.text === "string" ? m.text : "";
+	const resolvedText = rawText ? applyEntityResolution(rawText, entityMaps) : rawText;
 
 	log(
 		`${isReply ? "reply" : "message"} in ${channelName}${threadTs ? "/" + threadTs : ""} → ${matches.length} session(s)`,
@@ -540,12 +592,15 @@ slackApp.message(async ({ message }) => {
 			user_name: userName,
 		};
 		if (threadTs) meta.thread_ts = threadTs;
+		// If entity resolution changed the body, surface the original alongside
+		// so the agent can still see raw `<@U…>` / `<#C…>` if it ever needs to.
+		if (resolvedText !== rawText) meta.text_raw = rawText;
 
 		session.server
 			.notification({
 				method: "notifications/claude/channel",
 				params: {
-					content: m.text,
+					content: resolvedText,
 					meta: coerceMeta(meta),
 				},
 			})
@@ -598,9 +653,10 @@ async function routeReactionEvent(
 		return;
 	}
 
-	const [userName, channelName] = await Promise.all([
+	const [userName, channelName, itemUserName] = await Promise.all([
 		getUserName(event.user),
 		getChannelName(channelId),
+		event.item_user ? getUserName(event.item_user) : Promise.resolve(undefined),
 	]);
 
 	log(
@@ -609,11 +665,15 @@ async function routeReactionEvent(
 
 	const verb = kind === "reaction" ? "added" : "removed";
 	for (const session of matches) {
+		// Surface the *target* message's author in the content string so the
+		// agent doesn't have to cross-reference item_user vs the reactor — both
+		// the doer and the recipient are named in one line.
+		const onWhose = itemUserName ? ` (${itemUserName}'s message)` : "";
 		session.server
 			.notification({
 				method: "notifications/claude/channel",
 				params: {
-					content: `Reaction :${event.reaction}: ${verb} by ${userName} at ${renderTimestamp(event.event_ts)} on message ts=${itemTs} in ${channelName}.`,
+					content: `Reaction :${event.reaction}: ${verb} by ${userName} at ${renderTimestamp(event.event_ts)} on message ts=${itemTs}${onWhose} in ${channelName}.`,
 					meta: coerceMeta({
 						source: "slack-bus",
 						kind,
@@ -623,6 +683,7 @@ async function routeReactionEvent(
 						item_ts: itemTs,
 						item_when: renderTimestamp(itemTs),
 						item_user: event.item_user,
+						item_user_name: itemUserName,
 						ts: event.event_ts,
 						when: renderTimestamp(event.event_ts),
 						user_id: event.user,
@@ -1524,7 +1585,8 @@ const TOOLS: Tool[] = [
 				"• **Thread mode** (pass `thread_ts`): returns ONLY that thread's messages — parent + replies. Use this whenever the user references a specific thread or you're responding to a `thread_reply` notification. Look for `meta.thread_ts` in recent `notifications/claude/channel` system reminders, or extract from a Slack thread URL.\n\n" +
 				"• **Channel mode** (omit `thread_ts`): returns recent top-level activity in the channel.\n\n" +
 				"Prefer thread mode any time you have a real `thread_ts` available — channel mode pulls broad noise when you only wanted one conversation. Returns compact JSON with user names resolved.\n\n" +
-					"Each message includes `when` — an absolute rendered timestamp (e.g. `2026-05-27 08:54 PDT (Wed)`). Read time from `when`; it is authoritative. Do NOT convert the raw epoch `ts` to a date yourself. `when` is absolute only (no \"today/yesterday\") — compare it against your own known current date to judge recency.",
+					"Each message includes `when` — an absolute rendered timestamp (e.g. `2026-05-27 08:54 PDT (Wed)`). Read time from `when`; it is authoritative. Do NOT convert the raw epoch `ts` to a date yourself. `when` is absolute only (no \"today/yesterday\") — compare it against your own known current date to judge recency.\n\n" +
+					"Entity tokens in `text` are resolved: `<@U…>` → `@Name`, `<#C…>` → `#channel`, `<!here>` → `@here`, `<url|label>` → `label (url)`. The original is preserved on `text_raw` when a rewrite happened. Each reaction includes `users` — an array of resolved reactor display names — so you can answer 'who reacted with :tada:?' without a follow-up call.",
 		inputSchema: {
 			type: "object",
 			properties: {
@@ -1607,10 +1669,59 @@ const TOOLS: Tool[] = [
 				}),
 			);
 
+			// Entity resolution (DIG: agent-DX): batch-resolve all <@U…>/<#C…>
+			// references plus reaction-users across the returned messages in one
+			// parallel pass, then rewrite text + attach `reactor_names` per
+			// reaction. Cache hits dominate (the bot is mentioned in nearly every
+			// message and channels repeat). text_raw preserves the original so
+			// no information is lost.
+			const reactorIds = new Set<string>();
+			for (const m of enriched as any[]) {
+				if (Array.isArray(m.reactions)) {
+					for (const r of m.reactions) {
+						if (Array.isArray(r.users)) {
+							for (const u of r.users) reactorIds.add(u);
+						}
+					}
+				}
+			}
+			const entityMaps = await buildEntityMaps(
+				(enriched as any[]).map((m) => m.text),
+			);
+			// Fold reactor lookups into the same user map so the rewriter and the
+			// per-reaction reactor_names share one resolution pass.
+			await Promise.all(
+				[...reactorIds]
+					.filter((id) => !entityMaps.users.has(id))
+					.map(async (id) => {
+						entityMaps.users.set(id, await getUserName(id));
+					}),
+			);
+			const resolved = (enriched as any[]).map((m) => {
+				const next: any = { ...m };
+				if (typeof m.text === "string" && m.text.length > 0) {
+					const rewritten = applyEntityResolution(m.text, entityMaps);
+					if (rewritten !== m.text) {
+						next.text_raw = m.text;
+						next.text = rewritten;
+					}
+				}
+				if (Array.isArray(m.reactions)) {
+					next.reactions = m.reactions.map((r: any) => {
+						if (!Array.isArray(r.users)) return r;
+						const reactor_names = r.users.map(
+							(u: string) => entityMaps.users.get(u) ?? u,
+						);
+						return { ...r, reactor_names };
+					});
+				}
+				return next;
+			});
+
 			const out =
 				fmt === "compact"
-					? enriched.map(compactMessage)
-					: enriched.map((m: any) =>
+					? resolved.map(compactMessage)
+					: resolved.map((m: any) =>
 							m.ts ? { ...m, when: renderTimestamp(m.ts) } : m,
 						);
 			return JSON.stringify(out, null, 2);
