@@ -51,7 +51,7 @@ import {
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
-const VERSION = "0.8.1";
+const VERSION = "0.8.2";
 
 const INSTANCE = process.env.SLACK_BUS_INSTANCE;
 if (!INSTANCE) {
@@ -438,6 +438,14 @@ type Session = {
 	// uses it to drop sessions the client has abandoned without sending DELETE
 	// (which is what real MCP clients like Claude Code do today — see DIG-203).
 	lastSeen: number;
+	// Push-pipe (standalone GET SSE) liveness, tracked for the idle keepalive
+	// (DIG-311) and bus_status introspection. streamOpen is set OPTIMISTICALLY when
+	// a GET event-stream arrives (before the SDK may 409 a racing reconnect) and
+	// flipped false on the request's abort — so it is necessary-but-not-sufficient:
+	// a clean close is seen, a half-open death may not be. undefined = never opened.
+	streamOpen?: boolean;
+	streamOpenedAt?: number;
+	streamClosedAt?: number;
 };
 
 const sessions = new Map<string, Session>();
@@ -492,6 +500,59 @@ function takeRetainedSubs(sid: string): RetainedSubs | undefined {
 	retainedSubs.delete(sid);
 	if (Date.now() - r.retainedAt > RETAINED_SUBS_TTL_MS) return undefined;
 	return r;
+}
+
+// ─── Push-pipe (standalone GET SSE) liveness + write seam ─────────────────────
+
+// Write a raw chunk directly to a session's standalone GET SSE stream via the
+// SDK transport's internals — the same private-API seam the re-adopt priming
+// flush uses, factored out so the idle keepalive (DIG-311) shares it. Returns
+// true iff a chunk was enqueued. A bare SSE comment (": text\n\n") carries no
+// `id:`, so it is NOT stored in any eventStore and never participates in
+// resumability replay — exactly what a keepalive wants. Guarded because the
+// private field shape can shift across SDK bumps (pinned at 1.29.0).
+function enqueueToStream(
+	transport: WebStandardStreamableHTTPServerTransport,
+	text: string,
+): boolean {
+	try {
+		const t = transport as unknown as {
+			_streamMapping?: Map<
+				string,
+				{ controller?: { enqueue: (c: Uint8Array) => void }; encoder: TextEncoder }
+			>;
+			_standaloneSseStreamId?: string;
+		};
+		if (!t._standaloneSseStreamId) return false;
+		const entry = t._streamMapping?.get(t._standaloneSseStreamId);
+		if (!entry?.controller) return false;
+		entry.controller.enqueue(entry.encoder.encode(text));
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+// Mark a session's push pipe open and wire its close. A GET event-stream IS the
+// push pipe (re)opening; req.signal aborts when the client drops the SSE stream,
+// and THAT abort is the moment the session turns into a render-zombie (DIG-279).
+// Optimistic (see the Session.streamOpen note): if the SDK 409s a racing
+// reconnect the flag over-reports, but the keepalive gate no-ops on a stream with
+// no controller, so a false-positive is harmless.
+function markStreamOpen(s: Session, signal: AbortSignal): void {
+	s.streamOpen = true;
+	s.streamOpenedAt = Date.now();
+	signal.addEventListener(
+		"abort",
+		() => {
+			s.streamOpen = false;
+			s.streamClosedAt = Date.now();
+			log(
+				`SSE push stream CLOSED → ${s.id.slice(0, 8)}… (render pipe down until it reopens; if events go missing, RELAUNCH this session)`,
+			);
+		},
+		{ once: true },
+	);
 }
 
 // Pure lifecycle helpers (TTL expiry + idle reaping) live in lifecycle.ts so
@@ -1817,7 +1878,7 @@ const TOOLS: Tool[] = [
 	{
 		name: "bus_status",
 		description:
-			"Inspect the slack-bus daemon's current state: instance, uptime, bot identity, Slack connectivity, all active sessions and their subscriptions (channels + threads). The `slack` block reports the INBOUND Socket Mode link (carries replies/reactions): `connected`, `state`, and `seconds_since_last_event` — a healthy link sits in state `connected`; if it sticks off `connected` with a growing `seconds_since_last_event`, inbound is down. Outbound posting uses the Web API independently and is NOT reflected here (post failures surface per-call). Each subscription reports `expires_in_seconds` (null = session-lifetime). Each session reports `idle_seconds` (time since last HTTP request from this client) — sessions exceeding the idle threshold are reaped by the daemon. Use to diagnose 'did my notification arrive?' or to confirm which subscriptions this session currently holds. The caller's session is flagged with `is_self: true`.",
+			"Inspect the slack-bus daemon's current state: instance, uptime, bot identity, Slack connectivity, all active sessions and their subscriptions (channels + threads). The `slack` block reports the INBOUND Socket Mode link (carries replies/reactions): `connected`, `state`, and `seconds_since_last_event` — a healthy link sits in state `connected`; if it sticks off `connected` with a growing `seconds_since_last_event`, inbound is down. Outbound posting uses the Web API independently and is NOT reflected here (post failures surface per-call). Each subscription reports `expires_in_seconds` (null = session-lifetime). Each session reports `idle_seconds` (time since last HTTP request from this client) — sessions exceeding the idle threshold are reaped by the daemon. Each session also reports `push_stream` — the tracked liveness of its server→client SSE render pipe (`state`: `open` / `closed` / `never_opened`, plus `open_seconds` / `closed_seconds`). A `closed` pipe means notifications are dispatched server-side but NOT rendered by that client (the DIG-279/311 zombie) and the session must relaunch to recover. This is tracked-liveness, necessary-but-not-sufficient: `open` is set optimistically and a half-open death may not flip it, so treat it as a strong hint, not proof. Use to diagnose 'did my notification arrive?' or to confirm which subscriptions this session currently holds. The caller's session is flagged with `is_self: true`.",
 		inputSchema: {
 			type: "object",
 			properties: {
@@ -1870,6 +1931,23 @@ const TOOLS: Tool[] = [
 					id: s.id,
 					is_self: s.id === session.id,
 					idle_seconds: Math.floor((now - s.lastSeen) / 1000),
+					push_stream: {
+						// Tracked liveness (necessary-not-sufficient): "open" is optimistic
+						// and a half-open death may not flip it — see the Session.streamOpen
+						// note. Treat as a strong hint, not proof.
+						state:
+							s.streamOpenedAt === undefined
+								? "never_opened"
+								: s.streamOpen
+									? "open"
+									: "closed",
+						...(s.streamOpen && s.streamOpenedAt
+							? { open_seconds: Math.floor((now - s.streamOpenedAt) / 1000) }
+							: {}),
+						...(!s.streamOpen && s.streamClosedAt
+							? { closed_seconds: Math.floor((now - s.streamClosedAt) / 1000) }
+							: {}),
+					},
 					channels: Array.from(s.channels).map(subToObj),
 					threads: Array.from(s.threads).map(subToObj),
 				})),
@@ -2106,6 +2184,8 @@ Bun.serve({
 		}
 
 		const sessionId = req.headers.get("mcp-session-id") ?? undefined;
+		const accept = req.headers.get("accept") ?? "";
+		const isStream = accept.includes("text/event-stream");
 
 		// Existing session: route to its transport, bump lastSeen so the idle
 		// reaper doesn't kill us. Any HTTP request to this session counts as
@@ -2113,6 +2193,10 @@ Bun.serve({
 		if (sessionId && sessions.has(sessionId)) {
 			const s = sessions.get(sessionId)!;
 			s.lastSeen = Date.now();
+			// A GET event-stream is the push pipe (re)opening — track its liveness so
+			// the keepalive knows which streams to warm and bus_status can report the
+			// pipe state (DIG-311).
+			if (isStream && req.method === "GET") markStreamOpen(s, req.signal);
 			log(`req method=${req.method} session=${sessionId.slice(0, 8)}…`);
 			return s.transport.handleRequest(req);
 		}
@@ -2127,26 +2211,19 @@ Bun.serve({
 		// nothing — the DIG-279 zombie. Re-adopt instead: answer 200 with a fresh
 		// live stream coerced onto the same sid (and rehydrate its subs). channels-lab
 		// measured this recovers render+routing on a real client; 200-vs-404 is causal.
-		const accept = req.headers.get("accept") ?? "";
-		const isStream = accept.includes("text/event-stream");
 		if (sessionId && isStream && req.method === "GET") {
 			log(`re-adopt: unknown sid ${sessionId.slice(0, 8)}… on GET stream → 200 + fresh live stream`);
 			const { transport } = buildSessionServer(sessionId);
+			const readopted = sessions.get(sessionId);
+			if (readopted) markStreamOpen(readopted, req.signal);
 			const resp = await transport.handleRequest(req);
 			// Priming flush: enqueue an ignored SSE comment so 200 status+headers
-			// reach the client immediately. channels-lab measured this is NOT required
-			// on Bun.serve (Bun flushes headers when the streaming Response returns)
-			// but IS load-bearing on runtimes that withhold headers until first byte.
-			// Kept as harmless insurance so a future move off Bun stays safe.
-			try {
-				const t = transport as unknown as {
-					_streamMapping?: Map<string, { controller?: { enqueue: (b: Uint8Array) => void }; encoder: TextEncoder }>;
-					_standaloneSseStreamId?: string;
-				};
-				const entry = t._streamMapping?.get(t._standaloneSseStreamId ?? "");
-				entry?.controller?.enqueue(entry.encoder.encode(": slack-bus-readopt-priming\n\n"));
-			} catch (e) {
-				log(`re-adopt priming flush failed for ${sessionId.slice(0, 8)}…: ${e instanceof Error ? e.message : String(e)}`);
+			// reach the client immediately. NOT required on Bun.serve (Bun flushes
+			// headers when the streaming Response returns) but load-bearing on
+			// runtimes that withhold headers until first byte — kept as insurance.
+			// Shares the enqueueToStream seam with the keepalive.
+			if (!enqueueToStream(transport, ": slack-bus-readopt-priming\n\n")) {
+				log(`re-adopt priming flush no-op for ${sessionId.slice(0, 8)}… (no standalone stream yet)`);
 			}
 			return resp;
 		}
@@ -2212,6 +2289,42 @@ setInterval(() => {
 	}
 }, REAPER_INTERVAL_MS);
 
+// ─── Idle SSE keepalive (DIG-311) ─────────────────────────────────────────────
+// THE fix for the intermittent "subscribed but render-dead" zombie. A client
+// drops an IDLE standalone GET SSE stream after ~5 min and reconnects; on
+// reconnect the SDK's "one standalone stream per session" rule can 409 the new
+// GET when it races the old stream's teardown — the client retries twice, loses,
+// exhausts, and goes zombie (POST still works, render silently dead). Server-side
+// idleTimeout:0 keeps OUR end open but does nothing about the CLIENT's idle timer;
+// the robust fix is to never let the stream go idle. A periodic SSE comment
+// (ignored by the client's SSE parser; no `id:` so not a resumable event) keeps
+// it warm so the reconnect — and its 409 race — never happens. Period must stay
+// well under the ~5-min (300s) client idle timeout; 120s gives ~2.5x margin.
+//
+// Gate STRICTLY on stream liveness (streamOpen), never on app/sub state: a
+// session connects BEFORE it subscribes, so a sub-gated keepalive would let the
+// pre-subscribe cold window zombie the pipe before first use (channels-lab, from
+// peer-bus's original 298s-death bug). The only question the gate may ask is
+// "is this stream open." SLACK_BUS_KEEPALIVE_MS overrides the period (for tests).
+const KEEPALIVE_MS = (() => {
+	const fromEnv = Number(process.env.SLACK_BUS_KEEPALIVE_MS);
+	if (Number.isFinite(fromEnv) && fromEnv > 0) return Math.floor(fromEnv);
+	return 120_000;
+})();
+setInterval(() => {
+	for (const [id, s] of sessions) {
+		if (s.streamOpen !== true) continue; // only warm genuinely-open push pipes
+		if (!enqueueToStream(s.transport, ": keepalive\n\n")) {
+			// Optimistically-open but no live standalone controller (the SDK likely
+			// 409'd a racing reconnect, or the stream hasn't established yet). Log
+			// only — do NOT flip streamOpen here: the authoritative close is the GET's
+			// abort listener, and flipping on a transient miss risks parking a
+			// genuinely-live stream out of the warm set until its next reconnect.
+			log(`keepalive skipped → ${id.slice(0, 8)}… (streamOpen but no standalone stream yet)`);
+		}
+	}
+}, KEEPALIVE_MS);
+
 // ─── Start ────────────────────────────────────────────────────────────────────
 
 // Visual separator + key facts. When the log spans multiple restarts (which
@@ -2222,7 +2335,7 @@ log(
 	`slack-bus v${VERSION} starting — instance=${INSTANCE} port=${PORT} pid=${process.pid} bun=${process.versions.bun ?? "?"}`,
 );
 log(
-	`config — idle_reap=${IDLE_REAP_MS / 1000}s reaper_interval=${REAPER_INTERVAL_MS / 1000}s log=${LOG_FILE}`,
+	`config — idle_reap=${IDLE_REAP_MS / 1000}s reaper_interval=${REAPER_INTERVAL_MS / 1000}s keepalive=${KEEPALIVE_MS / 1000}s log=${LOG_FILE}`,
 );
 
 // Test harness only (DIG-279 re-adopt validation): boot HTTP-transport-only with

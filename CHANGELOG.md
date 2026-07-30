@@ -2,6 +2,34 @@
 
 All notable changes to slack-bus. Dates are when the version landed on `main`.
 
+## 0.8.2 — 2026-07-30 — Idle SSE keepalive + push-pipe liveness (DIG-311)
+
+The *killing* half of the "subscribed but render-dead" zombie (v0.8.1 fixed the
+*silencing* half). A client drops an idle standalone GET SSE stream after ~5 min;
+on reconnect the SDK's one-stream-per-session rule can 409 the racing reconnect,
+the client exhausts its 2 retries, and the push pipe goes dead while POST keeps
+working — the session looks healthy and silently renders nothing. slack-bus had
+zero keepalive (peer-bus 15, runtime-bus 24); the census of live push streams
+mapped onto keepalive presence, not usage (channels-lab, DIG-311).
+
+- **Periodic `: keepalive` SSE comment** (120s; `SLACK_BUS_KEEPALIVE_MS` overrides)
+  written to every open standalone stream so the client's idle timer never fires
+  and the 409-reconnect race never happens. A bare SSE comment carries no `id:`,
+  so the client parser ignores it and it never enters resumability replay.
+- **Push-pipe liveness tracking** — a GET event-stream marks the session
+  `streamOpen`; the request's abort flips it closed. Gated STRICTLY on stream
+  liveness, never on app/sub state (a sub-gated keepalive zombies the pre-subscribe
+  cold window — peer-bus's original 298s-death bug).
+- **`bus_status` reports `push_stream`** per session (`open`/`closed`/`never_opened`
+  + seconds) so a dead render pipe is visible instead of silent. Tracked-liveness
+  is necessary-but-not-sufficient (optimistic open; a half-open death may not flip
+  it) — a strong hint, not proof.
+- The re-adopt priming flush and the keepalive now share one `enqueueToStream`
+  seam. Frame-emission validated on the gated HTTP-only harness (4 `: keepalive`
+  frames at a 1.5s test interval + clean close detection, 0 skips); the end-to-end
+  proof is the post-deploy live-stream count climbing from 0 toward ~20 (the other
+  warmed buses' level) — channels-lab's falsifiable check.
+
 ## 0.8.1 — 2026-07-30 — Honest push-send logging (DIG-279)
 
 The success log for a server-pushed notification said `dispatched OK`. It isn't
