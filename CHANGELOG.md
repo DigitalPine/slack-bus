@@ -2,6 +2,24 @@
 
 All notable changes to slack-bus. Dates are when the version landed on `main`.
 
+## 0.8.1 — 2026-07-30 — Honest push-send logging (DIG-279)
+
+The success log for a server-pushed notification said `dispatched OK`. It isn't
+delivery confirmation: the MCP SDK's `send()` resolves even when it writes into a
+stale/half-open standalone SSE controller (no liveness check), so a resolved
+promise means "enqueued server-side," never "rendered by the client." That
+wording masked the DIG-279 zombie for months — a session whose push stream had
+silently died still logged `dispatched OK` on every lost event.
+
+- Both push-success sites now log `sent (send-side only, not delivery-confirmed)`
+  instead of `dispatched OK`, mirroring peer-bus's convention. Says only what the
+  daemon actually knows.
+- No behavior change; observability only. The client-side cause (the GET SSE
+  reconnect loop going dormant on an untouched bus) is being characterized by the
+  channels-lab probe rig; server-side *detection* of a dead stream
+  (`push_stream: dead` in `bus_status`) is scoped but deferred pending that
+  result. See the DIG-279 field report thread.
+
 ## 0.8.0 — 2026-07-30 — Entity resolution (agent-DX)
 
 Slack delivers message text with machine-encoded entity tokens (`<@U0123>`,

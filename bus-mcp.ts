@@ -51,7 +51,7 @@ import {
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
-const VERSION = "0.8.0";
+const VERSION = "0.8.1";
 
 const INSTANCE = process.env.SLACK_BUS_INSTANCE;
 if (!INSTANCE) {
@@ -605,7 +605,12 @@ slackApp.message(async ({ message }) => {
 				},
 			})
 			.then(() =>
-				log(`notification → ${session.id} dispatched OK (kind=${kind})`),
+				// NOT delivery confirmation: the SDK's send() resolves even when it
+				// writes into a stale/half-open standalone SSE controller (no liveness
+				// check), so a resolved promise means "enqueued server-side," never
+				// "rendered by the client." The old "dispatched OK" wording masked the
+				// DIG-279 zombie for months. Say only what we know. Mirrors peer-bus.
+				log(`notification → ${session.id} sent (send-side only, not delivery-confirmed; kind=${kind})`),
 			)
 			.catch((err) =>
 				log(`notification → ${session.id} dispatch FAILED: ${err}`),
@@ -692,7 +697,12 @@ async function routeReactionEvent(
 				},
 			})
 			.then(() =>
-				log(`notification → ${session.id} dispatched OK (kind=${kind})`),
+				// NOT delivery confirmation: the SDK's send() resolves even when it
+				// writes into a stale/half-open standalone SSE controller (no liveness
+				// check), so a resolved promise means "enqueued server-side," never
+				// "rendered by the client." The old "dispatched OK" wording masked the
+				// DIG-279 zombie for months. Say only what we know. Mirrors peer-bus.
+				log(`notification → ${session.id} sent (send-side only, not delivery-confirmed; kind=${kind})`),
 			)
 			.catch((err) =>
 				log(`notification → ${session.id} dispatch FAILED: ${err}`),
